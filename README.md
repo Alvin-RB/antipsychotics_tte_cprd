@@ -24,7 +24,11 @@ This study aimed to emualte a trial on the following research question: In adult
 
 4. Psychiatric hospitalisation outcome
 
-5. Other effectiveness outcomes
+5. Discontinuation and mortality outcomes
+
+6. Cumulative incidence
+
+7. Inverse probability of treatment weighting
 
 #### Contact
 
