@@ -1,0 +1,2063 @@
+# -----------------------
+# ANTIPSYCHOTICS TTE STUDY
+# -----------------------
+# Last run: 14/05/2024
+
+# DERIVE COHORT & CONSORT FLOW
+
+# Clear memory
+rm(list = ls())
+
+# Packages
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(forcats)
+library(lubridate)
+library(readr)
+library(readxl)
+library(data.table)
+library(purrr)
+library(rlang)
+library(reshape2)
+library(doseminer)
+library(drugprepr)
+library(chlorpromazineR)
+library(ggplot2)
+library(gtsummary)
+library(gt)
+library(mice)
+library(finalfit)
+library(tidylog)
+library(vroom)
+
+# Set file path
+path <- anonymised
+
+# Set working directory
+setwd(paste0(path))
+
+#Load files
+load("SMIcohort.rdata")
+load("antipsychotics_combined.rdata")
+
+# Exclude Prochlorperazine as primarily and frequently used as an antiemetic
+antipsychotics_combined <- antipsychotics_combined %>%
+  select(1:17) %>%
+  select(-numpacks, -issueseq) %>%
+  filter(AP != "Prochlorperazine")
+
+# IDENTIFY COHORT ####
+
+#Restrict to APs of interest
+apsofinterest <- antipsychotics_combined %>%
+  select(patid, AP, issuedate, deliverymethod) %>%
+  distinct() %>%
+  filter(AP %in% c("Aripiprazole", "Olanzapine", "Risperidone", "Quetiapine")) %>%
+  group_by(patid, AP, deliverymethod) %>%
+  mutate(min = min(issuedate),
+         deliverymethod = str_to_lower(deliverymethod)) %>%
+  ungroup()
+
+# Ever received aripiprazole
+ari <- apsofinterest %>%
+  filter(AP == "Aripiprazole" & min == issuedate) %>%
+  pivot_wider(
+    id_cols = patid,
+    names_from = deliverymethod,
+    values_from = issuedate,
+    names_prefix = "ari_first") %>%
+  mutate(ari_ever = 1) %>%
+  select(patid, ari_ever, ari_firstoral, ari_firstinjection)
+
+# Ever received olanzapine
+olanz <- apsofinterest %>%
+  filter(AP == "Olanzapine" & min == issuedate) %>%
+  pivot_wider(
+    id_cols = patid,
+    names_from = deliverymethod,
+    values_from = issuedate,
+    names_prefix = "olanz_first") %>%
+  mutate(olanz_ever = 1) %>%
+  select(patid, olanz_ever, olanz_firstoral, olanz_firstinjection)
+
+# Ever received risperidone
+risp <- apsofinterest %>%
+  filter(AP == "Risperidone" & min == issuedate) %>%
+  pivot_wider(
+    id_cols = patid,
+    names_from = deliverymethod,
+    values_from = issuedate,
+    names_prefix = "risp_first") %>%
+  mutate(risp_ever = 1) %>%
+  select(patid, risp_ever, risp_firstoral, risp_firstinjection)
+
+# Ever received quetiapine (note that there is no injectable form of quetiapine)
+quet <- apsofinterest %>%
+  filter(AP == "Quetiapine" & min == issuedate) %>%
+  mutate(deliverymethod = str_to_lower(deliverymethod)) %>%
+  pivot_wider(
+    id_cols = patid,
+    names_from = deliverymethod,
+    values_from = issuedate,
+    names_prefix = "quet_first") %>%
+  mutate(quet_ever = 1) %>%
+  select(patid, quet_ever, quet_firstoral)
+
+#First AP of interest
+first_wide <- apsofinterest %>%
+  group_by(patid) %>%
+  mutate(min = min(issuedate)) %>% 
+  ungroup() %>%
+  filter(min == issuedate) %>% # first prescription of an AP of interest
+  distinct() %>%
+  select(patid, AP) %>%
+  reshape2::dcast(patid ~ AP) %>%
+  mutate(Aripiprazole = if_else(Aripiprazole > 1, 1, Aripiprazole),
+         Olanzapine = if_else(Olanzapine > 1, 1, Olanzapine),
+         Risperidone = if_else(Risperidone > 1, 1, Risperidone),
+         Quetiapine = if_else(Quetiapine > 1, 1, Quetiapine)) %>%
+  mutate(sum = rowSums(select(., Aripiprazole, Olanzapine, Risperidone, Quetiapine), na.rm = FALSE))
+
+# Merge
+df_list <- list(ari, olanz, risp, quet, first_wide)
+
+tte_prevalent_cohort <- df_list %>% purrr::reduce(full_join, by = "patid")
+
+remove(ari, olanz, risp, quet, first_wide, apsofinterest, df_list)
+
+# Data management
+tte_prevalent_cohort <- tte_prevalent_cohort %>%
+  mutate(ari_firsttype = case_when(ari_ever == 1 & ari_firstoral == ari_firstinjection ~ "Oral & Injection",
+                                   ari_ever == 1 & is.na(ari_firstoral) ~ "Injection",
+                                   ari_ever == 1 & is.na(ari_firstinjection) ~ "Oral"),
+         olanz_firsttype = case_when(olanz_ever == 1 & olanz_firstoral == olanz_firstinjection ~ "Oral & Injection",
+                                     olanz_ever == 1 & is.na(olanz_firstoral) ~ "Injection",
+                                     olanz_ever == 1 & is.na(olanz_firstinjection) ~ "Oral"),
+         risp_firsttype = case_when(risp_ever == 1 & risp_firstoral == risp_firstinjection ~ "Oral & Injection",
+                                    risp_ever == 1 & is.na(risp_firstoral) ~ "Injection",
+                                    risp_ever == 1 & is.na(risp_firstinjection) ~ "Oral"),
+         quet_firsttype = case_when(quet_ever == 1 ~ "Oral"),
+         cohortentrydate = pmin(ari_firstoral, ari_firstinjection, risp_firstoral, risp_firstinjection, 
+                                olanz_firstoral, olanz_firstinjection, quet_firstoral, na.rm = TRUE),
+         trt_group = if_else(sum > 1, 0,
+                             if_else(Aripiprazole == 1 & sum == 1, 1,
+                                     if_else(Olanzapine == 1 & sum == 1, 2,
+                                             if_else(Quetiapine == 1 & sum == 1, 3,
+                                                     if_else(Risperidone == 1 & sum == 1, 4, NA_real_)))))) %>%
+  select(-contains("firstoral"), -contains("firstinjection"))
+
+tte_prevalent_cohort$trt_group <- factor(tte_prevalent_cohort$trt_group,
+                             levels = c(0, 1, 2, 3, 4),
+                             labels = c("Multiple", "Aripiprazole", "Olanzapine", "Quetiapine", "Risperidone"))
+
+# SMI diagnosis at time of cohort entry
+load("PatSMI_C.Rdata")
+
+diag_prev <- tte_prevalent_cohort %>%
+  select(patid, trt_group, cohortentrydate, sum, olanz_firsttype, ari_firsttype, quet_firsttype, risp_firsttype) %>%
+  left_join(PatSMI_C %>%
+              filter(eventdate > '1900-01-01'), # remove invalid dates
+            by = "patid") %>%
+  distinct()
+
+remove(PatSMI_C)
+
+diag_prev$datediff <- difftime(diag_prev$eventdate, diag_prev$cohortentrydate, units = "days") # compute date difference
+
+# Allows 30 days for potential recording delays
+# If more than one diagnosis on closest day, use schizophrenia, then bipolar, then other psychosis
+diag_prev <- diag_prev %>%
+  filter(datediff <= 30) %>%
+  group_by(patid) %>%
+  mutate(max = max(eventdate)) %>%
+  ungroup() %>%
+  filter(max == eventdate) %>%
+  group_by(patid) %>%
+  mutate(schz_any = ifelse(group == "schizophrenia", 1, 0),
+         bipolar_any = ifelse(group == "bipolar", 1, 0),
+         otherpsychosis_any = ifelse(group == "other psychosis", 1, 0)) %>%
+  ungroup() %>%
+  group_by(patid) %>%
+  mutate(schz_sum = sum(schz_any),
+         bipolar_sum = sum(bipolar_any),
+         otherpsychosis_sum = sum(otherpsychosis_any),
+         row = row_number(),
+         n = n()) %>%
+  ungroup() %>%
+  filter(row == 1) %>%
+  mutate(diag_prev = case_when(n > 1 & schz_sum > 0 ~ "schizophrenia",
+                               n > 1 & bipolar_sum > 0 & schz_sum == 0 ~ "bipolar",
+                               n > 1 & otherpsychosis_sum > 0 & schz_sum == 0 & bipolar_sum == 0 ~ "other psychosis",
+                               TRUE ~ group)) %>%
+  select(patid, diag_prev) %>%
+  distinct() %>%
+  mutate(diagosisatcohortentry = 1,
+         diag_prev = factor(diag_prev, levels = c("schizophrenia", "bipolar", "other psychosis")))
+
+# Baseline blood test (lipids or HbA1c)
+
+# Define a function to extract most recent baseline blood test data 
+# allows values to be recorded in the prior 2 yrs or up to 7 days after cohort entry.
+# 7 days chosen as the recorded date might relate to the date the results were received rather than when test done).
+extract_baseline_bloodtest <- function(extracted_data, variable_of_interest, result_df_name) {
+  
+  result_df <- tte_prevalent_cohort %>%
+    left_join(extracted_data, by = "patid") %>%
+    filter(!is.na({{ variable_of_interest }})) %>%
+    select(patid, cohortentrydate, {{ variable_of_interest }}, eventdate) %>%
+    filter(eventdate >= cohortentrydate - days(731) & eventdate <= cohortentrydate + days(7)) %>%
+    group_by(patid) %>%
+    mutate(baseline = max(eventdate)) %>%
+    ungroup() %>%
+    filter(baseline == eventdate) %>%
+    distinct() %>%
+    select(patid, baseline_value = {{ variable_of_interest }}, baseline_date = eventdate) %>%
+    distinct() %>%
+    rename_with(
+      ~ paste0("baseline_", strsplit(quo_text(enquo(variable_of_interest)), " ")[[1]][1]),
+      baseline_value
+    ) %>%
+    rename(!!paste0("baseline_", strsplit(quo_text(enquo(variable_of_interest)), " ")[[1]][1], "_date") := baseline_date) %>% # Rename the column dynamically
+    rename_with(~ gsub("_clean", "", .), starts_with("baseline_"))
+  
+  
+  assign(result_df_name, result_df, envir = .GlobalEnv)
+}
+
+# Load data
+load("SMIlipids_wide_clean.Rdata") #Lipids
+load("SMIhba1c_C.Rdata") # Hba1c
+
+extract_baseline_bloodtest(SMIlipids_wide_clean, totalcholesterol_clean, "tc_prev")
+extract_baseline_bloodtest(SMIlipids_wide_clean, hdl_clean, "hdl_prev")
+extract_baseline_bloodtest(SMIlipids_wide_clean, ldl_clean, "ldl_prev")
+extract_baseline_bloodtest(SMIlipids_wide_clean, triglycerides_clean, "triglycerides_prev")
+extract_baseline_bloodtest(SMIlipids_wide_clean, tchdlratio_clean, "tchdlratio_prev")
+extract_baseline_bloodtest(SMIhba1c_C, hba1c_clean, "hba1c_prev")
+
+# Dementia at baseline
+load("SMICharlson_C.Rdata")
+load("SMIElixhauser_C.Rdata")
+
+dementia_prev <- tte_prevalent_cohort %>%
+  select(patid, cohortentrydate) %>%
+  inner_join(
+    bind_rows(
+      SMICharlson_C %>% filter(condition == "Dementia") %>% 
+        select(patid, eventdate),
+      SMIElixhauser_C %>% filter(grepl("(?i)dementia|alzheimer", readterm)) %>% 
+        select(patid, eventdate)),
+    by = "patid") %>%
+  filter(difftime(eventdate, cohortentrydate, units = "days") <= 0) %>%
+  distinct(patid) %>%
+  mutate(priordementia = 1)
+
+# Received an LAI prior to cohort entry
+injection <- tte_prevalent_cohort %>%
+  select(patid, cohortentrydate) %>%
+  left_join(select(SMIcohort, patid, injection_firstdate), by = "patid") %>%
+  filter(difftime(injection_firstdate, cohortentrydate, units = "days") <= 0) %>%
+  mutate(priorinjection = 1) %>%
+  select(patid, priorinjection)
+
+# Most recent LAI
+injection_mostrecent <- tte_prevalent_cohort %>%
+  select(patid, cohortentrydate) %>%
+  left_join(antipsychotics_combined %>% filter(deliverymethod == "Injection"), by = "patid") %>%
+  mutate(lastinjectionpriortobaseline = as.numeric(difftime(issuedate, cohortentrydate, units = "days"))) %>%
+  filter(lastinjectionpriortobaseline <= 0) %>%
+  group_by(patid) %>%
+  filter(issuedate == max(issuedate)) %>%
+  ungroup() %>%
+  distinct(patid, lastinjectionpriortobaseline)
+
+# Mulitple APs (one of interest with one not of interest)
+napscohortentry <- tte_prevalent_cohort %>%
+  select(patid, cohortentrydate) %>%
+  left_join(antipsychotics_combined, by = "patid") %>%
+  filter(issuedate == cohortentrydate) %>%
+  select(patid, AP) %>%
+  distinct() %>%
+  group_by(patid) %>%
+  mutate(naps = n_distinct(AP)) %>%
+  ungroup() %>%
+  select(patid, naps) %>%
+  distinct()
+
+# Merge
+df_list <- list(tte_prevalent_cohort, diag_prev, tc_prev, ldl_prev, hdl_prev, triglycerides_prev, tchdlratio_prev, hba1c_prev, 
+                dementia_prev, dementia_afterentry, injection, injection_mostrecent, napscohortentry)
+
+tte_prevalent_cohort <- df_list %>% purrr::reduce(left_join, by = "patid")
+
+remove(df_list, tc_prev, hdl_prev, ldl_prev, triglycerides_prev, tchdlratio_prev, SMIlipids_wide_clean, hba1c_prev, SMIhba1c_C, 
+       dementia_prev, diag_prev, diag_excluded, napscohortentry, injection, injection_mostrecent)
+
+# Any baseline measuring requiring a blood test
+tte_prevalent_cohort$baseline_totalcholesterol_flag[tte_prevalent_cohort$baseline_totalcholesterol > 0] <- 1
+tte_prevalent_cohort$baseline_totalcholesterol_flag[is.na(tte_prevalent_cohort$baseline_totalcholesterol)] <- 0
+tte_prevalent_cohort$baseline_hdl_flag[tte_prevalent_cohort$baseline_hdl > 0] <- 1
+tte_prevalent_cohort$baseline_hdl_flag[is.na(tte_prevalent_cohort$baseline_hdl)] <- 0
+tte_prevalent_cohort$baseline_ldl_flag[tte_prevalent_cohort$baseline_ldl > 0] <- 1
+tte_prevalent_cohort$baseline_ldl_flag[is.na(tte_prevalent_cohort$baseline_ldl)] <- 0
+tte_prevalent_cohort$baseline_triglycerides_flag[tte_prevalent_cohort$baseline_triglycerides > 0] <- 1
+tte_prevalent_cohort$baseline_triglycerides_flag[is.na(tte_prevalent_cohort$baseline_triglycerides)] <- 0
+tte_prevalent_cohort$baseline_tchdlratio_flag[tte_prevalent_cohort$baseline_tchdlratio > 0] <- 1
+tte_prevalent_cohort$baseline_tchdlratio_flag[is.na(tte_prevalent_cohort$baseline_tchdlratio)] <- 0
+tte_prevalent_cohort$baseline_hba1c_flag[tte_prevalent_cohort$baseline_hba1c > 0] <- 1
+tte_prevalent_cohort$baseline_hba1c_flag[is.na(tte_prevalent_cohort$baseline_hba1c)] <- 0
+
+tte_prevalent_cohort$anybaseline_bloodtest <- rowSums(tte_prevalent_cohort[,c("baseline_totalcholesterol_flag", "baseline_hdl_flag", "baseline_ldl_flag", 
+                                                                        "baseline_triglycerides_flag", "baseline_tchdlratio_flag",
+                                                                        "baseline_hba1c_flag")], na.rm=TRUE)
+
+tte_prevalent_cohort$anybaseline_bloodtest[is.na(tte_prevalent_cohort$anybaseline_bloodtest)] <- 0
+tte_prevalent_cohort$priorinjection[is.na(tte_prevalent_cohort$priorinjection)] <- 0
+tte_prevalent_cohort$priordementia[is.na(tte_prevalent_cohort$priordementia)] <- 0
+
+# CONSORT FLOW ####
+# Merge with SMIcohort (master file of patients ever-diagnosed with SMI - merged for time-invariant baseline variables)
+tte_prevalent_cohort <- tte_prevalent_cohort %>%
+  full_join(SMIcohort, by = "patid")
+
+# Received oral APs ever
+tte_prevalent_cohort <- tte_prevalent_cohort %>%
+  filter(oralap_rec_bin == 1)
+
+receivedaps <- n_distinct(tte_prevalent_cohort$patid)
+
+# Received AP of interest
+tte_prevalent_cohort <- tte_prevalent_cohort %>%
+  filter(sum > 0) %>%
+  select(-sum, -Aripiprazole, -Quetiapine, -Risperidone, -Olanzapine)
+
+receivedapsofinterest <- n_distinct(tte_prevalent_cohort$patid)
+
+# Received AP of interest between January 2005 to December 2017
+# this allows the final patients to accrue 2 years of follow-up before 2020
+tte_prevalent_cohort <- tte_prevalent_cohort %>%
+  filter(cohortentrydate >= '2005-01-01' & cohortentrydate < '2018-01-01')
+
+receivedapsofinterestintimeperiod <- n_distinct(tte_prevalent_cohort$patid)
+
+# Remove patients with documented medical codes suggesting exposure to any one of the 4 APs prior to cohort entry
+load(file = "SMIantipsychoticsmedical_C.Rdata")
+
+tte_adversereactions <- tte_prevalent_cohort %>%
+  select(patid, cohortentrydate, trt_group) %>%
+  inner_join(SMIAntipsychoticsMedical_C, by = "patid") %>%
+  select(patid, cohortentrydate, trt_group, eventdate, readterm) %>%
+  filter(eventdate < cohortentrydate) %>%
+  filter(grepl("(?i)aripiprazole|quetiapine|olanzapine|risperidone", readterm)) %>%
+  mutate(diff = cohortentrydate - eventdate) %>%
+  select(patid) %>%
+  distinct() %>%
+  mutate(priorexposure = 1)
+
+tte_prevalent_cohort <- tte_prevalent_cohort %>%
+  left_join(tte_adversereactions, by = "patid") %>%
+  filter(is.na(priorexposure))
+
+priorexposuresuggested <- n_distinct(tte_prevalent_cohort$patid)
+remove(tte_adversereactions, SMIAntipsychoticsMedical_C)
+
+# Had an SMI diagnosis at time of receiving AP of interest (allowing up to 30 days for possible delayed reporting)
+tte_prevalent_cohort <- tte_prevalent_cohort %>%
+  filter(diagosisatcohortentry == 1 & !is.na(first_smi_diag)) %>%
+  select(-diagosisatcohortentry)
+  
+diagnosisatentry <- n_distinct(tte_prevalent_cohort$patid)
+
+#Age 18-99 at cohort entry
+tte_prevalent_cohort <- tte_prevalent_cohort %>%
+  mutate(prevcohortentry_year = lubridate::year(cohortentrydate),
+         age_atprevcohortentry = prevcohortentry_year - yob) %>%
+  filter(age_atprevcohortentry > 17 & age_atprevcohortentry < 100)
+
+agecriteria <- n_distinct(tte_prevalent_cohort$patid)
+
+# GP registration date is not after cohort entry, minimum 6 months registration required
+tte_prevalent_cohort <- tte_prevalent_cohort %>%
+  filter(difftime(cohortentrydate, regstartdate, units = "days") >= 180)
+
+medhistory <- n_distinct(tte_prevalent_cohort$patid)
+
+# With a blood test (for lipids or HbA1c) at baseline
+tte_prevalent_cohort <- tte_prevalent_cohort %>%
+  filter(anybaseline_bloodtest > 0)
+
+bloodtest <- n_distinct(tte_prevalent_cohort$patid)
+
+# Exclusion criteria
+
+# Remained in cohort as of overall end date - had not died
+tte_prevalent_cohort <- tte_prevalent_cohort %>%
+  filter(cohortentrydate < deathdate | is.na(deathdate))
+
+didnotdie <- n_distinct(tte_prevalent_cohort$patid)
+
+# Remained in cohort as of overall end date - had not deregistered
+tte_prevalent_cohort <- tte_prevalent_cohort %>%
+  filter(cohortentrydate < regenddate | is.na(regenddate))
+
+remainedregistered <- n_distinct(tte_prevalent_cohort$patid)
+
+# Remained in cohort as of overall end date - before last collection date (LCD)
+tte_prevalent_cohort <- tte_prevalent_cohort %>%
+  filter(cohortentrydate < lcd)
+
+notbeforelcd <- n_distinct(tte_prevalent_cohort$patid)
+
+# Dementia at baseline
+tte_prevalent_cohort <- tte_prevalent_cohort %>%
+  filter(priordementia != 1) %>%
+  select(-priordementia)
+
+priordementia <- n_distinct(tte_prevalent_cohort$patid)
+
+# Multiple APs of interest
+tte_prevalent_cohort <- tte_prevalent_cohort %>%
+  filter(trt_group != "Multiple")
+
+multiplepasofinterest <- n_distinct(tte_prevalent_cohort$patid)
+
+# First AP of interest was oral (not injection)
+tte_prevalent_cohort <- tte_prevalent_cohort %>%
+  mutate(notinjection = case_when(trt_group == "Olanzapine" & olanz_firsttype == "Oral" ~ 1,
+                                  trt_group == "Aripiprazole" & ari_firsttype == "Oral" ~ 1,
+                                  trt_group == "Quetiapine" & quet_firsttype == "Oral" ~ 1,
+                                  trt_group == "Risperidone" & risp_firsttype == "Oral" ~ 1,
+                                  TRUE ~ 0)) %>%
+  filter(notinjection == 1) %>%
+  select(-contains("firsttype"), -contains("_ever"))
+
+firstapofinterestoral <- n_distinct(tte_prevalent_cohort$patid)
+
+# Mulitple APs (one of interest with one not of interest)
+tte_prevalent_cohort <- tte_prevalent_cohort %>%
+  filter(naps == 1) %>%
+  select(-naps)
+
+multipleapsnotofinterest <- n_distinct(tte_prevalent_cohort$patid) 
+
+# Received an LAI in last 90 days
+tte_prevalent_cohort <- tte_prevalent_cohort %>%
+  filter(is.na(lastinjectionpriortobaseline) | lastinjectionpriortobaseline <= -90)
+
+injectioninlast90days <- n_distinct(tte_prevalent_cohort$patid) 
+
+# Identify duplicates through HES linkage
+
+# Load hes patient files
+hes_patient_gold_1 <- vroom(paste0(path, "hes_patient_21_000729.txt"), 
+                            delim = "\t", escape_double = FALSE, 
+                            col_types = cols(patid = col_character()), 
+                            trim_ws = TRUE) %>%
+  mutate(database = "Gold")
+
+hes_patient_gold_2 <- vroom(paste0(path, "hes_patient_21_000729_request2.txt"), 
+                            delim = "\t", escape_double = FALSE, 
+                            col_types = cols(patid = col_character()), 
+                            trim_ws = TRUE) %>%
+  mutate(database = "Gold")
+
+hes_patient_aurum <- vroom(paste0(path, "hes_patient_21_000729.txt"), 
+                           delim = "\t", escape_double = FALSE, 
+                           col_types = cols(patid = col_character()), 
+                           trim_ws = TRUE) %>%
+  mutate(database = "Aurum")
+
+hes_patient <- hes_patient_gold_1 %>%
+  bind_rows(hes_patient_gold_2) %>%
+  bind_rows(hes_patient_aurum) %>%
+  mutate(patid = if_else(database == "Gold", paste0(patid, "-G"),
+                         if_else(database == "Aurum", paste0(patid, "-A"), patid))) %>%
+  select(-database)
+
+remove(hes_patient_gold_1, hes_patient_gold_2, hes_patient_aurum)
+gc()
+
+# HES patient linked
+tte_hes_patient <- tte_prevalent_cohort %>%
+  select(patid, cohortentrydate, hes_apc_e, regstartdate, regenddate, lcd) %>%
+  filter(hes_apc_e == 1) %>%
+  mutate(database = case_when(grepl("(?i)A", patid) ~ "Aurum",
+                             TRUE ~ "Gold")) %>%
+  inner_join(hes_patient, by = "patid") %>%
+  group_by(gen_hesid) %>%
+  mutate(duplicate = n_distinct(patid)) %>%
+  ungroup() %>%
+  filter(duplicate > 1) %>%
+  mutate(is_longest_fup = case_when(!is.na(regenddate) ~ regenddate - cohortentrydate,
+                                    TRUE ~ lcd - cohortentrydate)) %>%
+  group_by(gen_hesid) %>%
+  mutate(earliest_date = min(cohortentrydate),
+         is_earliest = if_else(cohortentrydate == earliest_date, 1, 0),
+         all_earliest = all(is_earliest == 1),
+         is_aurum = if_else(database == "Aurum", 1, 0),
+         all_aurum = all(is_aurum == 1),
+         is_longest = ifelse(is_longest_fup == max(is_longest_fup), 1, 0)) %>%
+  ungroup() %>%
+  mutate(keep = case_when(all_earliest == FALSE & is_earliest == 1 ~ 1, # where the cohort entry dates are different, keep the earliest
+                          all_earliest == TRUE & all_aurum == FALSE & is_aurum == 1 ~ 1, # where the dates are the same, keep the aurum record
+                          all_earliest == TRUE & all_aurum == TRUE & is_longest == 1 ~ 2, # where both earliest, both aurum, use the one with longest follow-up (this ensures that just 1 of each duplicate pair is kept)
+                          TRUE ~ 0)) %>%
+  select(patid, keep)
+
+tte_prevalent_cohort <- tte_prevalent_cohort %>%
+  left_join(tte_hes_patient, by = "patid") %>%
+  filter(is.na(keep) | keep == 1) %>%
+  select(-keep)
+
+deduplicated <- n_distinct(tte_prevalent_cohort$patid)
+
+# CONSORT table
+consort1 <- data.frame(level = 1, Included = receivedaps, Excluded = 0, Reason = "Ever diagnosed with an SMI & prescribed an oral AP")
+consort2 <- data.frame(level = 2, Included = receivedapsofinterest, Excluded = receivedaps - receivedapsofinterest, Reason = "Ever prescribed an AP of interest")
+consort3 <- data.frame(level = 3, Included = receivedapsofinterestintimeperiod, Excluded = receivedapsofinterest - receivedapsofinterestintimeperiod, Reason = "First prescribed an AP of interest 2005-2017")
+consort4 <- data.frame(level = 4, Included = priorexposuresuggested, Excluded = receivedapsofinterestintimeperiod - priorexposuresuggested, Reason = "No medical codes indicating receipt of an AP of interest prior to first identified prescription")
+consort5 <- data.frame(level = 5, Included = diagnosisatentry, Excluded = priorexposuresuggested - diagnosisatentry, Reason = "Had an SMI diagnosis")
+consort6 <- data.frame(level = 6, Included = agecriteria, Excluded = diagnosisatentry - agecriteria, Reason = "Aged 18-99")
+consort7 <- data.frame(level = 7, Included = medhistory, Excluded = agecriteria - medhistory, Reason = "Registered at primary care practice for at least 6m")
+consort8 <- data.frame(level = 8, Included = bloodtest, Excluded = medhistory - bloodtest, Reason = "At least 1 blood test for lipids or HbA1c in prior 2y")
+consort9 <- data.frame(level = 9, Included = didnotdie, Excluded = bloodtest - didnotdie, Reason = "Did not die")
+consort10 <- data.frame(level = 10, Included = remainedregistered, Excluded = didnotdie - remainedregistered, Reason = "Did not end primary care registration")
+consort11 <- data.frame(level = 11, Included = notbeforelcd, Excluded = remainedregistered - notbeforelcd, Reason = "Index date is not after practice last collection date")
+consort12 <- data.frame(level = 12, Included = priordementia, Excluded = notbeforelcd - priordementia, Reason = "No dementia diagnosis")
+consort13 <- data.frame(level = 13, Included = multiplepasofinterest, Excluded = priordementia - multiplepasofinterest, Reason = "Not prescribed >1 AP of interest")
+consort14 <- data.frame(level = 14, Included = firstapofinterestoral, Excluded = multiplepasofinterest - firstapofinterestoral, Reason = "Not prescribed an AP of interest as an LAI")
+consort15 <- data.frame(level = 15, Included = multipleapsnotofinterest, Excluded = firstapofinterestoral - multipleapsnotofinterest, Reason = "Not prescribed >1 AP")
+consort16 <- data.frame(level = 16, Included = injectioninlast90days, Excluded = multipleapsnotofinterest - injectioninlast90days, Reason = "Not prescribed an LAI AP in last 90 days")
+consort17 <- data.frame(level = 17, Included = deduplicated, Excluded = injectioninlast90days - deduplicated, Reason = "De-duplicated following HES linkage")
+
+consort18 <- tte_prevalent_cohort %>%
+  count(trt_group) %>%
+  rename(Included = n) %>%
+  mutate(Reason = trt_group, Excluded = 0, level = 17 + row_number()) %>%
+  select(level, Included, Excluded, Reason) %>%
+  filter(Reason != "Multiple")
+
+consort <- rbind(consort1, consort2, consort3, consort4, consort5, consort6, consort7, consort8, consort9, consort10, 
+                 consort11, consort12, consort13, consort14, consort15, consort16, consort17, consort18) %>%
+  mutate(level_type = case_when(level <= 4 ~ "Exposure",
+                                level >= 5 & level < 9 ~ "Inclusion criteria, on index date",
+                                level >= 9 & level < 18 ~ "Exclusion criteria, on index date",
+                                level >= 18 ~ "Included",
+                                TRUE ~ "-")) %>%
+  gt() %>%
+  gtsave(paste0("_", today(), ".docx"))
+
+# DERIVE BASELINE VARIABLES ####
+
+tte_prevalent_cohort <- tte_prevalent_cohort %>%
+  mutate(age_atcohortentry_cat = factor(case_when(age_atprevcohortentry < 30 ~ 1, # Age at cohort entry categories
+                                                   age_atprevcohortentry >= 30 & age_atprevcohortentry < 40 ~ 2,
+                                                   age_atprevcohortentry >= 40 & age_atprevcohortentry < 65 ~ 3,
+                                                   age_atprevcohortentry >= 65 & age_atprevcohortentry < 85 ~ 4,
+                                                   age_atprevcohortentry >= 85 ~ 5), 
+                                         levels = c(1, 2, 3, 4, 5), labels = c("<30", "30-39", "40-64", "65-84", "85+"))) %>%
+  mutate(age_atcohortentry_cat_two = factor(case_when(age_atprevcohortentry < 50 ~ 1, # Age at cohort entry (two categories)
+                                                      age_atprevcohortentry >= 50 ~ 2), 
+                                            levels = c(1, 2), labels = c("Under 50", "50 or over"))) %>%
+  mutate(cohortentry_year = lubridate::year(cohortentrydate), # Cohort entry (antipsychotic initiation) time period
+         cohortentry_timeperiod = factor(case_when(cohortentry_year >= 2005 & cohortentry_year < 2010 ~ 1,
+                                                   cohortentry_year >= 2010 & cohortentry_year < 2015 ~ 2,
+                                                   cohortentry_year >= 2015 ~ 3), 
+                                         levels = c(1, 2, 3), labels = c("2005-2009", "2010-2014", "2015+")))
+
+# Years from first SMI diagnosis to index date
+tte_prevalent_cohort <- tte_prevalent_cohort %>% 
+  mutate(years_diagtoindex = as.numeric((cohortentrydate - first_diagnosis_date)/365))
+
+# Concomitant medications
+
+# Antidepressants in past two years
+load("SMIAntidepressants.rdata")
+
+antidepressants_prev <- tte_prevalent_cohort %>%
+  select(patid, cohortentrydate) %>%
+  inner_join(SMIantidepressants %>% select(patid, issuedate), by = "patid") %>%
+  select(patid, cohortentrydate, issuedate) %>%
+  filter(issuedate >= cohortentrydate - days(731) & issuedate <= cohortentrydate) %>%
+  mutate(antidepressant_prior2years = 1) %>%
+  select(patid, antidepressant_prior2years) %>%
+  distinct()
+
+# Mood stabilisers in past two years
+load("SMIMoodstabilisers_C.rdata")
+
+moodstab_prev <- tte_prevalent_cohort %>%
+  select(patid, cohortentrydate) %>%
+  inner_join(SMImoodstabilisers_C %>% select(patid, issuedate), by = "patid") %>%
+  select(patid, cohortentrydate, issuedate) %>%
+  filter(issuedate >= cohortentrydate - days(731) & issuedate <= cohortentrydate) %>%
+  mutate(moodstab_prior2years = 1) %>%
+  select(patid, moodstab_prior2years) %>%
+  distinct()
+
+# (Other non-study) antipsychotics in past 2 years
+# issuedate < cohortentrydate used as only wanting to count the non-study APs
+priorapuse_prev <- tte_prevalent_cohort %>%
+  select(patid, cohortentrydate) %>%
+  inner_join(antipsychotics_combined, by = "patid") %>%
+  select(patid, cohortentrydate, issuedate) %>%
+  filter(issuedate >= cohortentrydate - days(731) & issuedate < cohortentrydate) %>%
+  mutate(apuse_prior2years = 1) %>%
+  select(patid, apuse_prior2years) %>%
+  distinct()
+
+# (Other non-study) antipsychotics in past ever
+priorapuseever_prev <- tte_prevalent_cohort %>%
+  select(patid, cohortentrydate) %>%
+  inner_join(antipsychotics_combined, by = "patid") %>%
+  select(patid, cohortentrydate, issuedate) %>%
+  filter(issuedate < cohortentrydate) %>%
+  mutate(apuse_priorever = 1) %>%
+  select(patid, apuse_priorever) %>%
+  distinct()
+
+# Lipid regulating drugs in past two years
+load("SMIlipiddrugs_C.rdata")
+
+lipiddrugs_prev <- tte_prevalent_cohort %>%
+  select(patid, cohortentrydate) %>%
+  inner_join(SMIlipiddrugs_C, by = "patid") %>%
+  select(patid, cohortentrydate, issuedate) %>%
+  filter(issuedate >= cohortentrydate - days(731) & issuedate <= cohortentrydate) %>%
+  mutate(lipiddrugs_prior2years = 1) %>%
+  select(patid, lipiddrugs_prior2years) %>%
+  distinct()
+
+# Antihypertensives in past two years
+load("SMIhypertensionmeds_C.rdata")
+
+hypertensiondrugs_prev <- tte_prevalent_cohort %>%
+  select(patid, cohortentrydate) %>%
+  inner_join(SMIhypertensionmeds_C, by = "patid") %>%
+  select(patid, cohortentrydate, issuedate) %>%
+  filter(issuedate >= cohortentrydate - days(731) & issuedate <= cohortentrydate) %>%
+  mutate(hypertensiondrugs_prior2years = 1) %>%
+  select(patid, hypertensiondrugs_prior2years) %>%
+  distinct()
+
+# Antidiabetics in past two years
+load("SMIantidiabetics_C.rdata")
+
+antidiabetics_prev <- tte_prevalent_cohort %>%
+  select(patid, cohortentrydate) %>%
+  inner_join(SMIantidiabetics_C, by = "patid") %>%
+  select(patid, cohortentrydate, issuedate) %>%
+  filter(issuedate >= cohortentrydate - days(731) & issuedate <= cohortentrydate) %>%
+  mutate(antidiabetics_prior2years = 1) %>%
+  select(patid, antidiabetics_prior2years) %>%
+  distinct()
+
+# Number of different APs used prior to cohort entry
+naps_prior <- tte_prevalent_cohort %>%
+  select(patid, cohortentrydate) %>%
+  inner_join(antipsychotics_combined, by = "patid") %>%
+  mutate(prioruse = issuedate - cohortentrydate) %>%
+  filter(prioruse < 0) %>%
+  group_by(patid) %>%
+  mutate(naps_prior = n_distinct(AP),
+         min = min(issuedate),
+         max = max(issuedate),
+         APduration_prior = as.numeric(max - min)/365.25) %>%
+  ungroup() %>%
+  select(patid, naps_prior, APduration_prior) %>%
+  distinct()
+
+# Merge
+df_list <- list(tte_prevalent_cohort, priorapuse_prev, priorapuseever_prev, antidepressants_prev, moodstab_prev, lipiddrugs_prev, hypertensiondrugs_prev, antidiabetics_prev, naps_prior)
+
+tte_prevalent_cohort <- df_list %>% purrr::reduce(full_join, by = "patid")
+
+remove(df_list, priorapuse_prev, priorapuseever_prev, antidepressants_prev, moodstab_prev, lipiddrugs_prev, hypertensiondrugs_prev, antidiabetics_prev,
+       SMIlipiddrugs_C, SMIhypertensionmeds_C, SMIantidiabetics_C, SMIantidepressants, SMImoodstabilisers_C, naps_prior)
+
+tte_prevalent_cohort <- tte_prevalent_cohort %>% # set any missing concomitant medication values to 'No' and convert to factor
+  mutate(across(apuse_prior2years:antidiabetics_prior2years, ~ if_else(is.na(.), "No", if_else(. == 1, "Yes", "No"))),
+         across(apuse_prior2years:antidiabetics_prior2years, ~ factor(., levels = c("No", "Yes"))))
+
+# Baseline antipsychotic dose
+# Clean dosage texts with lookup tables
+lookup <- read_excel("Data files/Misc/lookup.xlsx")
+conditional_lookup <- read_excel("Data files/Misc/conditional_lookup.xlsx")
+
+apdose_prev <- tte_prevalent_cohort %>%
+  select(patid, cohortentrydate) %>%
+  inner_join(antipsychotics_combined, by = c("patid" = "patid", "cohortentrydate" = "issuedate")) %>%
+  filter(AP != "Prochlorperazine") %>% 
+  rename(prodcode = prodcodeid) %>%
+  mutate(dosage_text_raw = dosage_text) %>%
+  left_join(conditional_lookup, by = c("dosage_text", "productname")) %>%
+  mutate(success = ifelse(is.na(code), 0, 1),
+         dosage_text = ifelse(success == 1, code, dosage_text)) %>%
+  select(-success, -code) %>%
+  left_join(lookup, by = "dosage_text") %>%
+  mutate(success = ifelse(is.na(code), 0, 1),
+         dosage_text = ifelse(success == 1, code, dosage_text)) %>%
+  select(-success, -code, -`Dupe check`) %>%
+  distinct() # consider unique prescriptions only
+
+# Extract free text prescription instructions and convert to numeric values, using doseminer, then merge with original data
+free_text <- with(apdose_prev, dosage_text[!duplicated(dosage_text) & nchar(dosage_text) > 0])
+extracted <- doseminer::extract_from_prescription(free_text)
+apdose_prev <- merge(extracted, apdose_prev, by.x = 'raw', by.y = 'dosage_text', all = TRUE)
+
+# Create new variables as per doseminer instructions
+apdose_prev <- apdose_prev %>%
+  separate(dose, c('min_dose', 'max_dose'), sep = '-',
+           convert = TRUE, fill = 'right') %>%
+  separate(itvl, c('min_itvl', 'max_itvl'), sep = '-',
+           convert = TRUE, fill = 'right') %>%
+  separate(freq, c('min_freq', 'max_freq'), sep = '-',
+           convert = TRUE, fill = 'right') %>%
+  mutate(dose = coalesce((min_dose + max_dose) / 2, min_dose),
+         itvl = coalesce((min_itvl + max_itvl) / 2, min_itvl, 1),
+         freq = coalesce((min_freq + max_freq) / 2, min_freq),
+         ndd = freq * dose / itvl,
+         dose_num = readr::parse_number(strength), # create numeric value of dose
+         dose_num = case_when(grepl("micro", productname) | grepl("micro", strength) ~ dose_num/1000, # Convert mcg to mg
+                              TRUE ~ dose_num)) %>%
+  select(-min_dose, -max_dose, -min_itvl, -max_itvl, -min_freq, -max_freq, -unit) %>%
+  select(patid, cohortentrydate, AP, productname, formulation, route, dosage_text_raw, dosage_text_processed = raw, strength, dose_num, everything())
+
+apdose_prev <- apdose_prev %>%
+  mutate(ndd_calc = case_when(!grepl("ml", strength) & quantity > 1 & quantity == duration & is.na(ndd) ~ round(quantity / duration, 1), # if qty/dur are the same & > 1 & AP is not prescribed in ml, calculate NDD
+                              !grepl("ml", strength) & duration > 6 & duration <= 122 & quantity > 1 & quantity < 500 & is.na(ndd) ~ round(quantity / duration, 1), # if qty/dur are not the same, apply some limits
+                              TRUE ~ NA_real_), # if criteria not met, set to NA
+         ndd_calc = round(ndd_calc/.25)*.25, # round to nearest 0.25
+         ndd_calc = case_when(ndd_calc == 0.0 ~ NA_real_, # if rounded value is 0, set to missing
+                              TRUE ~ ndd_calc),
+         ndd = coalesce(ndd, ndd_calc)) %>% # use newly calculated ndd if original ndd is missing
+  select(-ndd_calc)
+
+# Times dose in mg by number of tablets taken per day
+apdose_prev <- apdose_prev %>%
+  mutate(total_daily_dose = dose_num * ndd)
+
+# Convert to chlorpromazine and olanzapine equivalent doses, using chlorpromazineR 
+apdose_prev <- chlorpromazineR::to_ap(apdose_prev, convert_to_ap = "olanzapine", 
+                                      convert_to_route = "oral", ap_label = "AP", 
+                                      dose_label = "total_daily_dose", key = leucht2016)
+
+# Where mulitple prescriptions on the same day, consider up to three prescriptions of each AP per patient, 
+# then sum the total dose per prescription date, then filter to one row per patient
+# where there are multiple prescriptions on the date, provide dose only if there is at least one known NDD (cross-checked with where NDD is known for them all - averages are unchanged and the former reduces the missing data)
+apdose_prev <- apdose_prev %>%
+  group_by(patid, cohortentrydate, AP) %>%
+  arrange(., desc(ndd)) %>%
+  mutate(num = row_number()) %>%
+  ungroup() %>%
+  filter(num < 3) %>%
+  group_by(patid, cohortentrydate) %>%
+  mutate(doseknownforall = !any(is.na(ndd)),
+         dose_total_rawunit = ifelse(doseknownforall != FALSE, sum(total_daily_dose), NA),
+         dose_total_olanz = ifelse(doseknownforall != FALSE, sum(ap_eq), NA),
+         dose_total_cpz = ifelse(doseknownforall != FALSE, sum(cpz_eq), NA),
+         partial_dose_any = ifelse(any(ndd > 0), 1, 0),
+         partial_dose_olanz = ifelse(partial_dose_any == 1, sum(ap_eq, na.rm = TRUE), NA),
+         partial_dose_rawunit = ifelse(partial_dose_any == 1, sum(total_daily_dose, na.rm = TRUE), NA),
+         partial_dose_cpz = ifelse(partial_dose_any == 1, sum(cpz_eq, na.rm = TRUE), NA),
+         num = row_number()) %>%
+  ungroup() %>%
+  filter(num == 1) %>%
+  select(patid, baselinedose_raw = partial_dose_rawunit, baselinedose_cpz = partial_dose_cpz, baselinedose_olanz = partial_dose_olanz)
+
+# Weight
+load("SMIweight_C.Rdata")
+
+weight_prev <- tte_prevalent_cohort %>%
+  select(patid, cohortentrydate) %>%
+  inner_join(SMIweight_C, by = "patid") %>%
+  filter(eventdate >= cohortentrydate - days(731) & eventdate <= cohortentrydate) %>%
+  group_by(patid) %>%
+  mutate(baseline = max(eventdate)) %>%
+  ungroup() %>%
+  filter(baseline == eventdate) %>%
+  distinct() %>%
+  group_by(patid) %>%
+  mutate(meanweightkg = mean(weightkg)) %>%
+  ungroup() %>%
+  select(patid, cohortentrydate, baseline_weightkg = meanweightkg, baseline_weightkg_date = eventdate) %>%
+  distinct()
+
+# BMI values recorded directly in CPRD
+load("SMIBMI_combined.Rdata")
+
+BMI_prev <- tte_prevalent_cohort %>%
+  select(patid, cohortentrydate) %>%
+  inner_join(SMIBMI_C, by = "patid") %>%
+  filter(eventdate >= cohortentrydate - days(731) & eventdate <= cohortentrydate) %>%
+  group_by(patid) %>%
+  mutate(baseline = max(eventdate)) %>%
+  ungroup() %>%
+  filter(baseline == eventdate) %>%
+  distinct() %>%
+  group_by(patid) %>%
+  mutate(meanbmi = mean(bmi)) %>%
+  ungroup() %>%
+  select(patid, baseline_bmi = meanbmi, baseline_bmi_date = eventdate) %>%
+  distinct()
+
+# Height
+load("SMIheight_C.Rdata")
+
+# Choose height from most recent recording (in past or future)
+height_prev <- tte_prevalent_cohort %>%
+  select(patid, cohortentrydate) %>%
+  left_join(SMIheight_C, by = "patid") %>%
+  select(patid, cohortentrydate, eventdate, height) %>%
+  mutate(diff = eventdate - cohortentrydate,
+         diff = abs(diff)) %>%
+  group_by(patid) %>%
+  filter(abs(diff-5)==min(abs(diff-5))) %>%
+  ungroup() %>%
+  select(patid, height) %>%
+  distinct() %>%
+  group_by(patid) %>%
+  mutate(meanheight = mean(height)) %>%
+  ungroup() %>%
+  select(patid, height = meanheight) %>%
+  distinct()
+
+# BMI categories recorded directly in CPRD
+load("SMIBMIcat_C.Rdata")
+
+BMIcat_prev <- tte_prevalent_cohort %>%
+  select(patid, cohortentrydate) %>%
+  inner_join(SMIBMIcat_C, by = "patid") %>%
+  filter(eventdate >= cohortentrydate - days(731) & eventdate <= cohortentrydate) %>%
+  group_by(patid) %>%
+  mutate(baseline = max(eventdate)) %>%
+  ungroup() %>%
+  filter(baseline == eventdate) %>%
+  distinct() %>%
+  group_by(patid, eventdate) %>%
+  mutate(num = row_number(),
+         anyobese = ifelse(BMIcat == "Obese", 1, 0), # handle multiple on the same day
+         anyoverweight = ifelse(BMIcat == "Overweight", 1, 0),
+         anyhealthy = ifelse(BMIcat == "Healthy", 1, 0),
+         anyunderweight = ifelse(BMIcat == "Underweight", 1, 0)) %>%
+  ungroup() %>%
+  group_by(patid) %>%
+  mutate(num_sum = sum(num),
+         obese_sum = sum(anyobese),
+         overweight_sum = sum(anyoverweight),
+         healthy_sum = sum(anyhealthy),
+         underweightweight_sum = sum(anyunderweight)) %>%
+  ungroup() %>%
+  mutate(BMIcat = case_when(num_sum > 1 & obese_sum > 0 ~ "Obese",
+                            num_sum > 1 & overweight_sum > 0 & obese_sum == 0 ~ "Overweight",
+                            num_sum > 1 & healthy_sum > 0 & obese_sum == 0 & overweight_sum == 0 ~ "Healthy",
+                            num_sum > 1 & underweightweight_sum > 0 & obese_sum == 0 & overweight_sum == 0 & healthy_sum == 0 ~ "Underweight",
+                            TRUE ~ BMIcat)) %>%
+  filter(num == 1) %>%
+  select(patid, baseline_bmi_cat = BMIcat, baseline_bmicatdate = eventdate)
+
+# Merge all together
+weightandBMI_prev <- weight_prev %>%
+  full_join(BMI_prev, by = "patid") %>%
+  full_join(height_prev, by = "patid") %>%
+  full_join(BMIcat_prev, by = "patid") %>%
+  mutate(bmi_calc = round(baseline_weightkg/height^2, 2)) %>%
+  mutate(baseline_bmi = coalesce(baseline_bmi, bmi_calc),
+         baseline_bmi_date = coalesce(baseline_bmi_date, baseline_weightkg_date)) %>%
+  select(-bmi_calc) %>%
+  mutate(baseline_bmi_date = case_when(is.na(baseline_bmi) ~ NA,
+                                       TRUE ~ baseline_bmi_date)) %>%
+  mutate(BMIcat_calc = case_when(baseline_bmi < 18.5 ~ "Underweight",
+                                 baseline_bmi >= 18.5 & baseline_bmi < 25 ~ "Healthy",
+                                 baseline_bmi >= 25 & baseline_bmi < 30 ~ "Overweight",
+                                 baseline_bmi >= 30 ~ "Obese")) %>%
+  mutate(baseline_bmi_cat = coalesce(BMIcat_calc, baseline_bmi_cat),
+         baseline_bmi_cat = factor(baseline_bmi_cat)) %>% 
+  select(-BMIcat_calc, -cohortentrydate, -baseline_bmicatdate) %>%
+  mutate(weight_calc = round(baseline_bmi*height^2, 2)) %>% # calculate weight from BMI and height
+  mutate(baseline_weightkg_date = case_when(!is.na(weight_calc) & is.na(baseline_weightkg) ~ baseline_bmi_date,
+                                            TRUE ~ baseline_weightkg_date),
+         baseline_weightkg = coalesce(baseline_weightkg, weight_calc)) %>% # use calculated weight for those that are missing
+  select(-weight_calc)
+  
+# Blood pressure
+load("SMIBloodPressure_C.Rdata")
+
+#Systolic
+systolic_prev <- tte_prevalent_cohort %>%
+  select(patid, cohortentrydate) %>%
+  inner_join(SMIBloodPressure_C, by = "patid") %>%
+  filter(!is.na(systolicbp)) %>%
+  select(patid, cohortentrydate, systolicbp, eventdate) %>%
+  filter(eventdate >= cohortentrydate - days(731) & eventdate <= cohortentrydate) %>%
+  group_by(patid) %>%
+  mutate(baseline = max(eventdate)) %>%
+  ungroup() %>%
+  filter(baseline == eventdate) %>%
+  distinct() %>%
+  select(patid, baseline_systolicbp = systolicbp, baseline_systolicbp_date = eventdate) %>%
+  distinct()
+
+# Diastolic
+diastolic_prev <- tte_prevalent_cohort %>%
+  select(patid, cohortentrydate) %>%
+  inner_join(SMIBloodPressure_C, by = "patid") %>%
+  filter(!is.na(diastolicbp)) %>%
+  select(patid, cohortentrydate, diastolicbp, eventdate) %>%
+  filter(eventdate >= cohortentrydate - days(731) & eventdate <= cohortentrydate) %>%
+  group_by(patid) %>%
+  mutate(baseline = max(eventdate)) %>%
+  ungroup() %>%
+  filter(baseline == eventdate) %>%
+  distinct() %>%
+  select(patid, baseline_diastolicbp = diastolicbp, baseline_diastolicbp_date = eventdate) %>%
+  distinct()
+
+# Glucose (fasting or random)
+load("SMIglucose_C.Rdata")
+extract_baseline_bloodtest(SMIglucose_C, glucose, "glucose_prev")
+
+# Merge
+df_list <- list(tte_prevalent_cohort, apdose_prev, weightandBMI_prev, systolic_prev, diastolic_prev, glucose_prev)
+
+tte_prevalent_cohort <- df_list %>% purrr::reduce(full_join, by = "patid")
+
+remove(df_list, lookup, conditional_lookup, apdose_prev, extracted, free_text, BMIcat_prev, BMI_prev, SMIBMI_C, SMIBMIcat_C, weightandBMI_prev, weight_prev, SMIweight_C, 
+       height_prev, SMIheight_C, diastolic_prev, systolic_prev, SMIBloodPressure_C, glucose_prev, SMIglucose_C)
+
+# BASELINE DIAGNOSES ####
+
+# Identify cerebrovascular disease at baseline
+cerebrovascular_prev <- tte_prevalent_cohort %>%
+  select(patid, cohortentrydate) %>%
+  inner_join(SMICharlson_C %>%
+              filter(condition == "Cerebrovascular disease"),
+            by = "patid")  %>%
+  filter(difftime(eventdate, cohortentrydate, units = "days") <= 0) %>%
+  select(patid) %>%
+  distinct() %>%
+  mutate(priorcerebrovasculardisease = 1)
+
+# Identify MI at baseline
+myocardial_prev <- tte_prevalent_cohort %>%
+  select(patid, cohortentrydate) %>%
+  inner_join(SMICharlson_C %>%
+               filter(condition == "Myocardial infarction"),
+             by = "patid") %>%
+  filter(difftime(eventdate, cohortentrydate, units = "days") <= 0) %>%
+  select(patid) %>%
+  distinct() %>%
+  mutate(priormyocardialinfarction = 1)
+
+# Identify Diabetes at baseline (from Charlson and Elixhauser code lists)
+diabetes_prev <- tte_prevalent_cohort %>%
+  select(patid, cohortentrydate) %>%
+  inner_join(
+    bind_rows(
+      SMICharlson_C %>% filter(grepl("(?i)diabetes", condition)) %>% 
+        select(patid, eventdate),
+      SMIElixhauser_C %>% filter(grepl("(?i)diabetes", condition)) %>% 
+        select(patid, eventdate)),
+    by = "patid") %>%
+  filter(difftime(eventdate, cohortentrydate, units = "days") <= 0) %>%
+  select(patid) %>%
+  distinct() %>%
+  mutate(priordiabetes = 1)
+
+# Identify liver disease at baseline (from Charlson and Elixhauser code lists)
+liver_prev <- tte_prevalent_cohort %>%
+  select(patid, cohortentrydate) %>%
+  inner_join(
+    bind_rows(
+      SMICharlson_C %>% filter(condition == "Mild liver disease" | condition == "Moderate or severe liver disease") %>% 
+        filter(readterm != "hepatitis c screening offered" & readterm != "hepatitis notification") %>%
+        select(patid, eventdate),
+      SMIElixhauser_C %>% filter(condition == "Liver disease") %>% 
+        filter(readterm != "hepatitis c screening offered" & readterm != "hepatitis notification") %>%
+        select(patid, eventdate)),
+    by = "patid") %>%
+  filter(difftime(eventdate, cohortentrydate, units = "days") <= 0) %>%
+  select(patid) %>%
+  distinct() %>%
+  mutate(priorliverdisease = 1)
+
+# Identify renal disease at baseline (from Charlson and Elixhauser code lists)
+renal_prev <- tte_prevalent_cohort %>%
+  select(patid, cohortentrydate) %>%
+  inner_join(
+    bind_rows(
+      SMICharlson_C %>% filter(condition == "Renal disease") %>% 
+        select(patid, eventdate),
+      SMIElixhauser_C %>% filter(condition == "Renal disease") %>% 
+        select(patid, eventdate)),
+    by = "patid") %>%
+  filter(difftime(eventdate, cohortentrydate, units = "days") <= 0) %>%
+  distinct(patid) %>%
+  mutate(priorrenaldisease = 1)
+
+# Alcohol misuse at baseline
+alcohol_prev <- tte_prevalent_cohort %>%
+  select(patid, cohortentrydate) %>%
+  inner_join(SMIElixhauser_C %>%
+               filter(condition == "Alcohol abuse"),
+             by = "patid") %>%
+  filter(difftime(eventdate, cohortentrydate, units = "days") <= 0) %>%
+  select(patid) %>%
+  distinct() %>%
+  mutate(prioralcoholabuse = 1)
+
+# Substance misuse at baseline
+substance_prev <- tte_prevalent_cohort %>%
+  select(patid, cohortentrydate) %>%
+  inner_join(SMIElixhauser_C %>%
+               filter(condition == "Drug abuse" & !grepl("(?i)alcohol misuse", readterm)),
+             by = "patid") %>%
+  filter(difftime(eventdate, cohortentrydate, units = "days") <= 0) %>%
+  select(patid) %>%
+  distinct() %>%
+  mutate(priorsubstanceabuse = 1)
+
+# Hypertension at baseline
+htn_prev <- tte_prevalent_cohort %>%
+  select(patid, cohortentrydate) %>%
+  inner_join(SMIElixhauser_C %>%
+               filter(grepl("(?i)hypertension", condition)),
+             by = "patid") %>%
+  filter(difftime(eventdate, cohortentrydate, units = "days") <= 0) %>%
+  select(patid) %>%
+  distinct() %>%
+  mutate(priorhypertension = 1)
+
+# Dyslipiaedmia at baseline
+load("SMIDyslipidaemia_C.Rdata")
+
+dyslipidaemia_prev <- tte_prevalent_cohort %>%
+  select(patid, cohortentrydate) %>%
+  inner_join(SMIDyslipidaemia_C, by = "patid") %>%
+  filter(difftime(eventdate, cohortentrydate, units = "days") <= 0) %>%
+  select(patid) %>%
+  distinct() %>%
+  mutate(priordyslipidaemia = 1)
+
+# Number of GP consults in the last six months
+load("SMIGPConsults_C.Rdata")
+
+gpconsults_prev <- tte_prevalent_cohort %>%
+  select(patid, cohortentrydate) %>%
+  inner_join(SMIGPConsults_C, by = "patid") %>%
+  filter(difftime(eventdate, cohortentrydate, units = "days") >= -180 & difftime(eventdate, cohortentrydate, units = "days") <= 0) %>%
+  select(patid, eventdate) %>%
+  distinct() %>%
+  group_by(patid) %>%
+  mutate(gpconsults_last6m = n()) %>%
+  ungroup() %>%
+  select(patid, gpconsults_last6m) %>%
+  distinct()
+
+df_list <- list(tte_prevalent_cohort, charlson_prev, cerebrovascular_prev, myocardial_prev, diabetes_prev, liver_prev, renal_prev, elixhauser_prev, alcohol_prev, 
+                substance_prev, htn_prev, dyslipidaemia_prev, gpconsults_prev)
+
+tte_prevalent_cohort <- df_list %>% purrr::reduce(full_join, by = "patid")
+
+remove(df_list, charlson_prev, cerebrovascular_prev, myocardial_prev, diabetes_prev, liver_prev, renal_prev, elixhauser_prev, alcohol_prev, 
+       substance_prev, htn_prev, dyslipidaemia_prev, SMIDyslipidaemia_C, gpconsults_prev, SMIGPConsults_C)
+
+tte_prevalent_cohort <- tte_prevalent_cohort %>% # set any missing concomintant medication values to 'No'
+  mutate(across(charlsonscore:gpconsults_last6m, ~ if_else(is.na(.), 0, .)))
+
+# Smoking status
+load("SMIsmokingstatus_C.Rdata")
+
+smi_smoking <- tte_prevalent_cohort %>%
+  select(patid, cohortentrydate) %>%
+  left_join(SMIsmokingstatus_C, by = "patid") %>%
+  distinct()
+
+# Create hierarchy (current, ex, never, missing) to handle ties
+score_category <- function(status) {
+  if (sum(!is.na(status)) == 0) {
+    return(NA)
+  } else if (sum(status == 2 & !is.na(status)) > 0) {
+    return("Current")
+  } else if (sum(status == 1 & !is.na(status)) > 0) {
+    return("Ex")
+  } else {
+    return("Never")}}
+
+# Look back over whole medical history
+smoking_prev <- smi_smoking %>%
+  filter(eventdate <= cohortentrydate) %>%
+  group_by(patid) %>%
+  mutate(ever = ifelse(smoking_status %in% c(1, 2), 1, 0),
+         max = max(eventdate)) %>%
+  ungroup() %>%
+  filter(max == eventdate) %>%
+  group_by(patid) %>%
+  mutate(smoking_status_cat = score_category(smoking_status)) %>%
+  ungroup() %>%
+  select(patid, smoking_status_cat) %>%
+  distinct()
+
+tte_prevalent_cohort <- merge(tte_prevalent_cohort, smoking_prev, by = "patid", all = TRUE)
+
+# For patients with missing smoking data, check future records to see if they only ever have never smoked codes
+missing_smoking <- tte_prevalent_cohort %>%
+  filter(is.na(smoking_status_cat)) %>%
+  select(patid, smoking_status_cat) %>%
+  left_join(smi_smoking, by = "patid") %>%
+  select(patid, medcode, readterm, eventdate, smoking_status) %>%
+  group_by(patid) %>%
+  mutate(smoking_status_cat = score_category(smoking_status)) %>% # Apply score_category function to create smoking status categories
+  ungroup() %>%
+  group_by(patid) %>%
+  summarize(only_never = all(smoking_status_cat == "Never")) %>% # Identify participants who only fall in the "Never" category
+  filter(only_never == TRUE)
+
+# Merge into TTE data frame
+tte_prevalent_cohort <- merge(tte_prevalent_cohort, missing_smoking, by = "patid", all = TRUE)
+
+tte_prevalent_cohort$smoking_status_cat[tte_prevalent_cohort$only_never == TRUE] <- "Never"
+
+tte_prevalent_cohort <- tte_prevalent_cohort %>%
+  select(-only_never)
+
+remove(smoking_prev, smi_smoking, SMIsmokingstatus_C, missing_smoking)
+
+tte_prevalent_cohort$smoking_status_cat <- factor(tte_prevalent_cohort$smoking_status_cat,
+                                                  levels = c("Never", "Ex", "Current"))
+
+remove(SMIElixhauser_C, SMICharlson_C)
+
+# OUTCOMES ####
+
+# Number of different APs prescribed in study period
+sameap_prev <- tte_prevalent_cohort %>%
+  select(patid, cohortentrydate, trt_group) %>%
+  inner_join(antipsychotics_combined, by = "patid") %>%
+  filter(issuedate >= cohortentrydate & issuedate < '2020-01-01') %>%
+  filter(difftime(issuedate, cohortentrydate, units = "days") <= 731) %>%
+  group_by(patid) %>%
+  mutate(naps_in2yrs = n_distinct(AP)) %>%
+  ungroup() %>%
+  select(patid, naps_in2yrs) %>%
+  distinct()
+
+tte_prevalent_cohort <- merge(tte_prevalent_cohort, sameap_prev, by = "patid", all = TRUE)
+remove(sameap_prev)
+
+# Time to discontinuation
+discontinuation <- tte_prevalent_cohort %>%
+  select(patid, cohortentrydate, trt_group, regenddate, lcd, deathdate) %>%
+  inner_join(antipsychotics_combined, by = "patid") %>%
+  filter(issuedate >= cohortentrydate & issuedate < '2020-01-01') %>% # filter to records within study period
+  filter(issuedate <= cohortentrydate + days(730)) %>% # filter to records within 2 years for each patient
+  select(patid, cohortentrydate, trt_group, issuedate, productname, AP, deliverymethod, strength, regenddate, lcd, deathdate) %>%
+  arrange(patid, issuedate)
+
+extract_discontinuation <- function(drug_name) {
+  
+  discontinuation %>%
+    filter(trt_group == drug_name & AP == drug_name) %>% # process each medication separately
+    group_by(patid) %>% 
+    arrange(issuedate) %>%
+    mutate(diff = as.numeric(issuedate - lag(issuedate)),
+           first90 = if_else(diff >= 90, 1, 0),
+           last = if_else(row_number() == n(), 1, 0),
+           discontinue_date = if_else(last == 1, issuedate + days(90), NA_Date_)) %>%
+    ungroup() %>%
+    filter(first90 == 1 & last == 0 | last == 1 & first90 == 1 | last == 1 & first90 == 0 | last == 1 & is.na(first90)) %>% # identify first 90 day gap or last record
+    group_by(patid) %>%
+    mutate(min = min(issuedate)) %>%
+    ungroup() %>%
+    filter(min == issuedate) %>%
+    select(-min) %>%
+    group_by(patid) %>%
+    mutate(n = row_number()) %>%
+    ungroup() %>%
+    filter(n == 1) %>% # filter one row per patient as assumed if they have more than one prescription on same day that it is on the same duration
+    select(-n) %>%
+    mutate(discontinue_date = issuedate + days(90), # generate discontinuation date
+           afterdeath = discontinue_date > deathdate, # flag if after death
+           afterregenddate = discontinue_date > regenddate, # flag if after regenddate
+           afterlcd = discontinue_date > lcd, # flag if after lcd
+           afterstudyend = discontinue_date > '2020-01-01', # flag if after study end date
+           discontinue_date = case_when(afterdeath == TRUE | afterregenddate == TRUE | afterlcd == TRUE | afterstudyend == TRUE ~ NA, # if after any of the above dates, do not consider as discontinued
+                                        TRUE ~ discontinue_date), # otherwise use discontinuation date
+           discontinued = case_when(afterdeath == TRUE | afterregenddate == TRUE | afterlcd == TRUE ~ 0, # if after any of the above dates, do not consider as discontinued
+                                    last == 1 & diff >= 90 ~ 1,
+                                    last == 1 & is.na(diff) ~ 1,
+                                    first90 == 1 ~ 1,
+                                    TRUE ~ 0), # only had one prescription
+           daystodiscontinuation = case_when(discontinued == 1 ~ as.numeric(discontinue_date - cohortentrydate),
+                                             TRUE ~ NA),
+           discontinue_date = case_when(discontinued == 1 ~ discontinue_date,
+                                        TRUE ~ NA)) %>%
+    select(patid, discontinued, discontinue_date, daystodiscontinuation)}
+
+ari_discontinue <- extract_discontinuation("Aripiprazole")
+olanz_discontinue <- extract_discontinuation("Olanzapine")
+risp_discontinue <- extract_discontinuation("Risperidone")
+quet_discontinue <- extract_discontinuation("Quetiapine")
+
+discontinuation_processed <- rbind(ari_discontinue, olanz_discontinue, quet_discontinue, risp_discontinue)
+
+tte_prevalent_cohort <- tte_prevalent_cohort %>%
+  left_join(discontinuation_processed, by = "patid") %>%
+  mutate(discontinuation_fupend = pmin(discontinue_date, regenddate, lcd, deathdate, na.rm = TRUE),
+         discontinuation_fuptime_days = as.numeric(discontinuation_fupend - cohortentrydate),
+         discontinuation_fuptime_days_cen = case_when(discontinuation_fuptime_days > 729 ~ 730,
+                                  TRUE ~ discontinuation_fuptime_days)) # censor at 2 years
+
+# Total number of prescriptions 
+extract_totalprescriptions <- function(drug_name) {
+  
+  discontinuation %>%
+    filter(trt_group == drug_name & AP == drug_name) %>%
+    select(patid, issuedate) %>%
+    group_by(patid) %>%
+    mutate(total_prescriptions = n_distinct(issuedate)) %>%
+    ungroup() %>%
+    select(patid, total_prescriptions) %>%
+    distinct()}
+
+ari_prescipt <- extract_totalprescriptions("Aripiprazole")
+risp_prescript <- extract_totalprescriptions("Risperidone")
+olanz_prescript <- extract_totalprescriptions("Olanzapine")
+quet_prescript <- extract_totalprescriptions("Quetiapine")
+
+prescription_totals <- rbind(ari_prescipt, risp_prescript, olanz_prescript, quet_prescript) 
+
+tte_prevalent_cohort <- tte_prevalent_cohort %>%
+  left_join(prescription_totals, by = "patid")
+
+remove(ari_discontinue, olanz_discontinue, quet_discontinue, risp_discontinue, discontinuation,
+       ari_prescipt, risp_prescript, olanz_prescript, quet_prescript, discontinuation_processed, prescription_totals)
+
+# Switch to an AP of interest
+switch <- tte_prevalent_cohort %>%
+  select(patid, cohortentrydate, trt_group, discontinued, discontinue_date, regenddate, lcd, deathdate) %>%
+  inner_join(antipsychotics_combined, by = "patid") %>%
+  filter(issuedate >= cohortentrydate & issuedate < '2020-01-01') %>% # filter to records in study period
+  filter(issuedate <= cohortentrydate + days(730)) %>% # filter to records within 2 years
+  select(patid, cohortentrydate, trt_group, issuedate, productname, AP, deliverymethod, strength, regenddate, lcd, deathdate) %>%
+  arrange(patid, issuedate)
+
+extract_switch <- function(data, med_name, search_str) {
+  data %>%
+    filter(trt_group == med_name) %>% # process each medication separately, filter to group of interest
+    group_by(patid) %>%
+    mutate(receivedother = if_else(grepl(search_str, AP, ignore.case = TRUE), 1, 0), # check for matches with any of the other AP names
+           sum = sum(receivedother),
+           switched = if_else(sum > 0, 1, 0), # if there was a match, then they are considered to have switched
+           receivedother_min = if_else(receivedother == 1 & issuedate == min(issuedate[receivedother == 1]), 1, 0),
+           switch_date = if_else(receivedother == 1, min(issuedate[receivedother == 1]), NA),
+           row = row_number()) %>%
+    ungroup() %>%
+    filter(switched == 0 & row == 1 | switched == 1 & receivedother_min == 1) %>%
+    select(patid, switched, switch_date) %>%
+    distinct()}
+
+ari_switch <- extract_switch(switch, "Aripiprazole", "olanzapine|quetiapine|risperidone")
+quet_switch <- extract_switch(switch, "Quetiapine", "olanzapine|aripiprazole|risperidone")
+olanz_switch <- extract_switch(switch, "Olanzapine", "quetiapine|aripiprazole|risperidone")
+risp_switch <- extract_switch(switch, "Risperidone", "quetiapine|aripiprazole|olanzapine")
+
+switch <- rbind(ari_switch, quet_switch, olanz_switch, risp_switch)
+
+tte_prevalent_cohort <- tte_prevalent_cohort %>%
+  left_join(switch, by = "patid")
+
+remove(switch, ari_switch, quet_switch, olanz_switch, risp_switch, antipsychotics_combined)
+
+# Mortality outcomes
+tte_prevalent_cohort <- tte_prevalent_cohort %>%
+  mutate(timetodeath = deathdate - cohortentrydate,
+         diedby6m = case_when(timetodeath <= 180 ~ 1,
+                              TRUE ~ 0),
+         diedby1y = case_when(timetodeath <= 365 ~ 1,
+                              TRUE ~ 0),
+         diedby2y = case_when(timetodeath <= 730 ~ 1,
+                              TRUE ~ 0))
+
+# Study end date
+tte_prevalent_cohort <- tte_prevalent_cohort %>%
+  mutate(studyend_date = as.Date('2019-12-31'))
+         
+tte_prevalent_cohort <- tte_prevalent_cohort %>%
+  mutate(ons_end = case_when(ons_death_e == 1 ~ as.Date("2021-03-29"), # The end date for ONS linkage is 29Mar2021
+                             TRUE ~ NA),
+         primarycare_end = case_when(!is.na(deathdate) ~ deathdate,  # if they have a death date, use this
+                                     !is.na(regenddate) & !is.na(lcd) ~ pmin(regenddate, lcd, studyend_date), # otherwise earliest of end of registration/lcd if both observed or study end
+                                     is.na(regenddate) ~ lcd, # use lcd if regenddate is missing
+                                     TRUE ~ regenddate), # otherwise use regenddate
+         onssample_end = case_when(ons_death_e == 1 & !is.na(deathdate) ~ deathdate,  # if they have a death date, use this
+                                   ons_death_e == 1 ~ pmin(ons_end, studyend_date), # otherwise use end of ons linkage or end of study period
+                                   TRUE ~ NA),
+         mortality_fup_end = case_when(diedby2y == 1 ~ deathdate, # if died by 2 years, then use death date
+                             diedby2y == 0 & !is.na(primarycare_end) & !is.na(onssample_end) ~ pmax(primarycare_end, onssample_end), # if they have both end dates, use the latest, as they have been observed up to the later point
+                             diedby2y == 0 & is.na(onssample_end) ~ primarycare_end, # if ons missing, use primarycare
+                             TRUE ~ onssample_end), # otherwise use ons, but this wont be used in practice
+         mortality_fuptime_days = as.numeric(mortality_fup_end - cohortentrydate),
+         mortality_fuptime_days_cen = case_when(mortality_fuptime_days > 729 ~ 730,
+                                 TRUE ~ mortality_fuptime_days)) %>%
+  select(-primarycare_end, -onssample_end)
+
+# Per-protocol mortality
+tte_prevalent_cohort <- tte_prevalent_cohort %>%
+  mutate(protocol_censordate = pmin(discontinue_date, switch_date, regenddate, lcd, studyend_date, na.rm = TRUE), # PP analyses censored at discontinuation/switch, or registration end/lcd as can't determine if they remained per protocol after that point (or study end)
+         mortality_pp_fuptime_days = as.numeric(protocol_censordate - cohortentrydate),
+         mortality_pp_fuptime_days_cen = case_when(mortality_pp_fuptime_days > 729 ~ 730,
+                                                   TRUE ~ mortality_pp_fuptime_days), # censor at 2 years
+         pp_censor = case_when(diedby2y == 1 & (deathdate > protocol_censordate) ~ TRUE,
+                               TRUE ~ FALSE),
+         diedby2yr_pp = case_when(pp_censor == TRUE ~ 0,
+                                  TRUE ~ diedby2y))
+
+# CARDIOMETABOLIC OUTCOMES
+
+#LOAD FILES
+load("SMIlipids_wide_clean.Rdata")
+load("SMIweight_C.Rdata")
+load("SMIBMI_combined.Rdata")
+load("SMIBloodPressure_C.Rdata")
+load("SMIhba1c_C.Rdata")
+load("SMIglucose_C.Rdata")
+
+# Functions
+
+# 1. Extract outcome data for all three time-points
+# This function can be called in a pipe or as per: extract_outcomes(df = ldl_merge, variable = "ldl")
+extract_outcomes <- function(df, variable) {
+  
+  # calculate datediff [number of days from eventdate to cohortentrydate]
+  df <- df %>% 
+    mutate(datediff = as.numeric(eventdate - cohortentrydate))
+  
+  # define timepoint names and definitions
+  time_defs <- list(
+    `sixm` = c(90, 270, 180), #  defines time definitions for each timepoint. Each list element represents the minimum, maximum, and actual timepoint values
+    `oney` = c(275, 455, 365),
+    `twoy` = c(550, 910, 730))
+  
+  # iterate over timepoints and calculate mean values
+  dfs <- lapply(names(time_defs), function(timepoint) {
+    
+    tp <- time_defs[[timepoint]]
+    
+    df %>%
+      filter(datediff >= tp[1] & datediff <= tp[2]) %>% # limit to values without the time period range
+      mutate(date = cohortentrydate + tp[3], # generate variable with the actual time point date
+             diff = abs(eventdate - date)) %>% # generate variable with absolute difference from the timepoint
+      group_by(patid) %>%
+      filter(diff == min(diff) & eventdate == max(eventdate)) %>% # filter to closest to timepoint, if >1 then use the one with the maximum eventdate (most long term)
+      distinct() %>%
+      group_by(patid) %>%
+      summarize(!!paste0(timepoint, "_", variable, "_nvalues") := n(), # add time point and variable name to the columns
+                mean_value = mean(!!sym(variable)),
+                !!paste0(timepoint, "_", variable) := mean_value, 
+                !!paste0(timepoint, "_", variable, "_date") := date,
+                !!paste0(timepoint, "_", variable, "_flag") := 1) %>%
+      ungroup() %>%
+      select(patid, 
+             !!paste0(timepoint, "_", variable, "_nvalues"),
+             !!paste0(timepoint, "_", variable),
+             !!paste0(timepoint, "_", variable, "_date"),
+             !!paste0(timepoint, "_", variable, "_flag")) %>%
+      distinct()
+  })
+  
+  # merge data frames by patid
+  Reduce(function(...) merge(..., by = "patid", all = TRUE), dfs) # merge all timepoints into one new df
+}
+
+# Identifiers for linkage
+identifiers <- tte_prevalent_cohort %>%
+  select(patid, cohortentrydate)
+
+# Merge
+lipids_merge <- merge(identifiers, SMIlipids_wide_clean, by = "patid",  all.x = TRUE, all.y = FALSE)
+weight_merge <- merge(identifiers, SMIweight_C, by = "patid", all.x = TRUE)
+bmi_merge <- merge(identifiers, SMIBMI_C, by = "patid", all.x = TRUE)
+bp_merge <- merge(identifiers, SMIBloodPressure_C, by = "patid", all.x = TRUE)
+hba1c_merge <- merge(identifiers, SMIhba1c_C, by = "patid", all.x = TRUE)
+glucose_merge <- merge(identifiers, SMIglucose_C, by = "patid", all.x = TRUE)
+remove(identifiers, SMIlipids_wide_clean, SMIweight_C, SMIBMI_C, SMIBloodPressure_C, SMIhba1c_C, SMIglucose_C)
+
+# TOTAL CHOLESTEROL
+tteprev_totalcholesterol <- lipids_merge %>%
+  filter(!is.na(totalcholesterol_clean)) %>%
+  select(patid, cohortentrydate, totalcholesterol = totalcholesterol_clean, eventdate) %>%
+  extract_outcomes(variable = "totalcholesterol")
+
+# HDL
+tteprev_hdl <- lipids_merge %>%
+  filter(!is.na(hdl_clean)) %>%
+  select(patid, cohortentrydate, hdl = hdl_clean, eventdate) %>%
+  extract_outcomes(variable = "hdl")
+
+# LDL
+tteprev_ldl <- lipids_merge %>%
+  filter(!is.na(ldl_clean)) %>%
+  select(patid, cohortentrydate, ldl = ldl_clean, eventdate) %>%
+  extract_outcomes(variable = "ldl")
+
+# TRIGLYCERIDES
+tteprev_triglycerides <- lipids_merge %>%
+  filter(!is.na(triglycerides_clean)) %>%
+  select(patid, cohortentrydate, triglycerides = triglycerides_clean, eventdate) %>%
+  extract_outcomes(variable = "triglycerides")
+
+# TC:HDL RATIO
+tteprev_tchdlratio <- lipids_merge %>%
+  filter(!is.na(tchdlratio_clean)) %>%
+  select(patid, cohortentrydate, tchdlratio = tchdlratio_clean, eventdate) %>%
+  extract_outcomes(variable = "tchdlratio")
+
+# WEIGHT
+tteprev_weight <- weight_merge %>%
+  filter(!is.na(weightkg)) %>%
+  select(patid, cohortentrydate, weightkg, eventdate) %>%
+  extract_outcomes(variable = "weightkg")
+
+# BMI (to be used to derive missing weights)
+tteprev_bmi <- bmi_merge %>%
+  filter(!is.na(bmi)) %>%
+  select(patid, cohortentrydate, bmi, eventdate) %>%
+  extract_outcomes(variable = "bmi")
+
+# SYSTOLIC BP
+tteprev_systolicbp <- bp_merge %>%
+  filter(!is.na(systolicbp)) %>%
+  select(patid, cohortentrydate, systolicbp, eventdate) %>%
+  extract_outcomes(variable = "systolicbp")
+
+# DIASTOLIC BP
+tteprev_diastolicbp <- bp_merge %>%
+  filter(!is.na(diastolicbp)) %>%
+  select(patid, cohortentrydate, diastolicbp, eventdate) %>%
+  extract_outcomes(variable = "diastolicbp")
+
+# HBA1C
+tteprev_hba1c <- hba1c_merge %>%
+  filter(!is.na(hba1c_clean)) %>%
+  select(patid, cohortentrydate, hba1c = hba1c_clean, eventdate) %>%
+  extract_outcomes(variable = "hba1c")
+
+# (ANY) GLUCOSE
+tteprev_glucose <- glucose_merge %>%
+  filter(!is.na(glucose)) %>%
+  select(patid, cohortentrydate, glucose, eventdate) %>%
+  extract_outcomes(variable = "glucose")
+
+# Calculate missing weights in people that had BMI values recorded
+updated_weight_outcomes <- tte_prevalent_cohort %>%
+  select(patid, height) %>%
+  full_join(tteprev_bmi, by = "patid") %>%
+  full_join(tteprev_weight, by = "patid") %>%
+  mutate(sixm_weightkg_calc = round(sixm_bmi*height^2, 2), # calculate weight from BMI and height
+         oney_weightkg_calc = round(oney_bmi*height^2, 2),
+         twoy_weightkg_calc = round(twoy_bmi*height^2, 2),
+         sixm_weightkg_date = case_when(!is.na(sixm_bmi) & is.na(sixm_weightkg) ~ sixm_bmi_date, # update dates
+                                        TRUE ~ sixm_weightkg_date),
+         oney_weightkg_date = case_when(!is.na(oney_bmi) & is.na(oney_weightkg) ~ oney_bmi_date,
+                                        TRUE ~ oney_weightkg_date),
+         twoy_weightkg_date = case_when(!is.na(twoy_bmi) & is.na(twoy_weightkg) ~ twoy_bmi_date,
+                                        TRUE ~ twoy_weightkg_date),
+         sixm_weightkg = coalesce(sixm_weightkg, sixm_weightkg_calc), # merge observed with calculated where missing
+         oney_weightkg = coalesce(oney_weightkg, oney_weightkg_calc),
+         twoy_weightkg = coalesce(twoy_weightkg, twoy_weightkg_calc)) %>%
+  select(-contains("bmi"), -contains("calc"), -height)
+
+# MERGE WITH COHORT DATA
+
+# List data frames for merge
+df_list <- list(tte_prevalent_cohort, tteprev_totalcholesterol, tteprev_hdl, tteprev_ldl, tteprev_triglycerides,
+                tteprev_tchdlratio, updated_weight_outcomes, tteprev_diastolicbp, tteprev_systolicbp, 
+                tteprev_glucose, tteprev_hba1c)
+
+tte_prevalent_cohort <- df_list %>% purrr::reduce(full_join, by = "patid")
+
+remove(df_list, tteprev_totalcholesterol, tteprev_hdl, tteprev_ldl, tteprev_triglycerides, tteprev_tchdlratio, tteprev_weight, tteprev_bmi, tteprev_diastolicbp, tteprev_systolicbp, 
+       tteprev_glucose, tteprev_hba1c, updated_weight_outcomes, lipids_merge, weight_merge, bp_merge, 
+       bmi_merge, hba1c_merge, glucose_merge)
+
+# DATA MANAGEMENT
+
+tte_prevalent_cohort <- tte_prevalent_cohort %>%
+  mutate(baseline_weightkg_flag = ifelse(!is.na(baseline_weightkg), 1, 0),
+         sixm_weightkg_flag = ifelse(!is.na(sixm_weightkg), 1, 0), # update weight flag variables, as additional weights were calculated from BMI
+         oney_weightkg_flag = ifelse(!is.na(oney_weightkg), 1, 0),
+         twoy_weightkg_flag = ifelse(!is.na(twoy_weightkg), 1, 0),
+         baseline_systolicbp_flag = ifelse(!is.na(baseline_systolicbp), 1, 0),
+         baseline_diastolicbp_flag = ifelse(!is.na(baseline_diastolicbp), 1, 0),
+         baseline_glucose_flag =  ifelse(!is.na(baseline_glucose), 1, 0))
+         
+# Set any missing outcome 'flag' variables to 0, these will be used to calculate levels of missing data
+tte_prevalent_cohort <- tte_prevalent_cohort %>%
+  mutate_at(vars(contains("flag")), ~if_else(is.na(.), 0, .)) %>%
+  mutate(
+    totalcholesterol_measures = rowSums(select(., contains("totalcholesterol_flag")), na.rm = FALSE),
+    hdl_measures = rowSums(select(., contains("hdl_flag")), na.rm = FALSE),
+    ldl_measures = rowSums(select(., contains("ldl_flag")), na.rm = FALSE),
+    triglycerides_measures = rowSums(select(., contains("triglycerides_flag")), na.rm = FALSE),
+    tchdlratio_measures = rowSums(select(., contains("tchdlratio_flag")), na.rm = FALSE),
+    systolicbp_measures = rowSums(select(., contains("systolicbp_flag")), na.rm = FALSE),
+    diastolicbp_measures = rowSums(select(., contains("diastolicbp_flag")), na.rm = FALSE),
+    hba1c_measures = rowSums(select(., contains("hba1c_flag")), na.rm = FALSE),
+    glucose_measures = rowSums(select(., contains("glucose_flag")), na.rm = FALSE),
+    weightkg_measures = rowSums(select(., contains("weightkg_flag")), na.rm = TRUE))
+
+# Any baseline measure, any baseline measuring requiring a blood test (previously calculated without glucose)
+tte_prevalent_cohort <- tte_prevalent_cohort %>%
+  mutate(anybaseline = rowSums(select(., c("baseline_totalcholesterol_flag", "baseline_hdl_flag", "baseline_ldl_flag",
+                                           "baseline_triglycerides_flag", "baseline_tchdlratio_flag", "baseline_weightkg_flag",
+                                           "baseline_systolicbp_flag", "baseline_diastolicbp_flag", "baseline_hba1c_flag",
+                                           "baseline_glucose_flag")), na.rm = FALSE),
+         anybaseline_bloodtest = rowSums(select(., c("baseline_totalcholesterol_flag", "baseline_hdl_flag", "baseline_ldl_flag", 
+                                                     "baseline_triglycerides_flag", "baseline_tchdlratio_flag", "baseline_hba1c_flag", "baseline_glucose_flag")), na.rm = FALSE))
+
+# Binary baseline variables
+tte_prevalent_cohort <- tte_prevalent_cohort %>%
+  mutate(anybaseline_bin = as.integer(anybaseline > 0),
+         anybaseline_bloodtest_bin = as.integer(anybaseline_bloodtest > 0),
+         totalcholesterol_bin = as.integer(totalcholesterol_measures > 0),
+         hdl_bin = as.integer(hdl_measures > 0),
+         ldl_bin = as.integer(ldl_measures > 0),
+         triglycerides_bin = as.integer(triglycerides_measures > 0),
+         tchdlratio_bin = as.integer(tchdlratio_measures > 0),
+         weightkg_bin = as.integer(weightkg_measures > 0),
+         systolicbp_bin = as.integer(systolicbp_measures > 0),
+         diastolicbp_bin = as.integer(diastolicbp_measures > 0),
+         hba1c_bin = as.integer(hba1c_measures > 0),
+         glucose_bin = as.integer(glucose_measures > 0))
+
+# Process HES data for psychiatric hospitalisation
+
+# Load files
+# hes patient files are already loaded
+
+# Primary diagnoses (associated with each HES episode)
+hes_diagnosis_epi_gold_1 <- vroom(paste0(path, "hes_diagnosis_epi_21_000729.txt"), 
+                                  delim = "\t", escape_double = FALSE, 
+                                  col_types = cols(patid = col_character(), 
+                                                   spno = col_number(), epikey = col_number(), 
+                                                   epistart = col_date(format = "%d/%m/%Y"), 
+                                                   epiend = col_date(format = "%d/%m/%Y"), 
+                                                   ICD = col_character(), ICDx = col_skip(), 
+                                                   d_order = col_number()), trim_ws = TRUE) %>%
+  mutate(database = "Gold")
+
+hes_diagnosis_epi_gold_2 <- vroom(paste0(path, "hes_diagnosis_epi_21_000729_request2.txt"), 
+                                  delim = "\t", escape_double = FALSE, 
+                                  col_types = cols(patid = col_character(), 
+                                                   spno = col_number(), epikey = col_number(), 
+                                                   epistart = col_date(format = "%d/%m/%Y"), 
+                                                   epiend = col_date(format = "%d/%m/%Y"), 
+                                                   ICD = col_character(), ICDx = col_skip(), 
+                                                   d_order = col_number()), trim_ws = TRUE) %>%
+  mutate(database = "Gold")
+
+hes_diagnosis_epi_aurum <- vroom(paste0(path, "hes_diagnosis_epi_21_000729.txt"), 
+                                 delim = "\t", escape_double = FALSE, 
+                                 col_types = cols(patid = col_character(), 
+                                                  spno = col_number(), epikey = col_number(), 
+                                                  epistart = col_date(format = "%d/%m/%Y"), 
+                                                  epiend = col_date(format = "%d/%m/%Y"), 
+                                                  ICD = col_character(), ICDx = col_skip(), 
+                                                  d_order = col_number()), trim_ws = TRUE) %>%
+  mutate(database = "Aurum")
+
+hes_primarydiag <- rbindlist(list(hes_diagnosis_epi_gold_1, hes_diagnosis_epi_gold_2, hes_diagnosis_epi_aurum)) %>%
+  mutate(patid = if_else(database == "Gold", paste0(patid, "-G"),
+                         if_else(database == "Aurum", paste0(patid, "-A"), patid))) %>%
+  select(-database)
+
+remove(hes_diagnosis_epi_gold_1, hes_diagnosis_epi_gold_2, hes_diagnosis_epi_aurum)
+gc()
+
+# HES hospitalisation index file
+hes_hosp_gold_1 <- vroom(paste0(path, "hes_diagnosis_hosp_21_000729.txt"), 
+                         delim = "\t", escape_double = FALSE, 
+                         col_types = cols(patid = col_character(), ICDx = col_skip(), admidate = col_date(format = "%d/%m/%Y"), 
+                                          discharged = col_date(format = "%d/%m/%Y")), 
+                         trim_ws = TRUE) %>%
+  mutate(database = "Gold")
+
+hes_hosp_gold_2 <- vroom(paste0(path, "hes_diagnosis_hosp_21_000729_request2.txt"), 
+                         delim = "\t", escape_double = FALSE, 
+                         col_types = cols(patid = col_character(), ICDx = col_skip(), admidate = col_date(format = "%d/%m/%Y"), 
+                                          discharged = col_date(format = "%d/%m/%Y")), 
+                         trim_ws = TRUE) %>%
+  mutate(database = "Gold")
+
+hes_hosp_aurum <- vroom(paste0(path, "hes_diagnosis_hosp_21_000729.txt"), 
+                        delim = "\t", escape_double = FALSE, 
+                        col_types = cols(patid = col_character(), ICDx = col_skip(), admidate = col_date(format = "%d/%m/%Y"), 
+                                         discharged = col_date(format = "%d/%m/%Y")), 
+                        trim_ws = TRUE) %>%
+  mutate(database = "Aurum")
+
+hes_hosp <- rbindlist(list(hes_hosp_gold_1, hes_hosp_gold_2, hes_hosp_aurum)) %>%
+  mutate(patid = if_else(database == "Gold", paste0(patid, "-G"),
+                         if_else(database == "Aurum", paste0(patid, "-A"), patid))) %>%
+  select(-database)
+
+remove(hes_hosp_gold_1, hes_hosp_gold_2, hes_hosp_aurum)
+gc()
+
+# HES episodes index file (contains episode admission/discharge dates, epitype, consultant specialty)
+hes_episodes_gold_1 <- vroom(paste0(path, "hes_episodes_21_000729.txt"), 
+                             delim = "\t", escape_double = FALSE, 
+                             col_types = cols(patid = col_character(), 
+                                              spno = col_number(), admidate = col_date(format = "%d/%m/%Y"), 
+                                              epistart = col_date(format = "%d/%m/%Y"), 
+                                              epiend = col_date(format = "%d/%m/%Y"), 
+                                              discharged = col_date(format = "%d/%m/%Y")), 
+                             trim_ws = TRUE) %>%
+  mutate(database = "Gold")
+
+hes_episodes_gold_2 <- vroom(paste0(path, "hes_episodes_21_000729_request2.txt"), 
+                             delim = "\t", escape_double = FALSE, 
+                             col_types = cols(patid = col_character(), 
+                                              spno = col_number(), admidate = col_date(format = "%d/%m/%Y"), 
+                                              epistart = col_date(format = "%d/%m/%Y"), 
+                                              epiend = col_date(format = "%d/%m/%Y"), 
+                                              discharged = col_date(format = "%d/%m/%Y")), 
+                             trim_ws = TRUE) %>%
+  mutate(database = "Gold")
+
+hes_episodes_aurum <- vroom(paste0(path, "hes_episodes_21_000729.txt"), 
+                            delim = "\t", escape_double = FALSE, 
+                            col_types = cols(patid = col_character(), 
+                                             spno = col_number(), admidate = col_date(format = "%d/%m/%Y"), 
+                                             epistart = col_date(format = "%d/%m/%Y"), 
+                                             epiend = col_date(format = "%d/%m/%Y"), 
+                                             discharged = col_date(format = "%d/%m/%Y")), 
+                            trim_ws = TRUE) %>%
+  mutate(database = "Aurum")
+
+hes_episodes <- rbindlist(list(hes_episodes_gold_1, hes_episodes_gold_2, hes_episodes_aurum)) %>%
+  mutate(patid = if_else(database == "Gold", paste0(patid, "-G"),
+                         if_else(database == "Aurum", paste0(patid, "-A"), patid))) %>%
+  select(-database)
+
+remove(hes_episodes_gold_1, hes_episodes_gold_2, hes_episodes_aurum)
+gc()
+
+# LIMIT TO SAMPLE OF INTEREST
+
+# Define study sample and linkage identifiers
+tte_hes_cohort <- tte_prevalent_cohort %>%
+  filter(hes_apc_e == 1) %>%
+  select(patid, cohortentrydate)
+
+# HES patient linked, check if there are any remaining duplicates
+tte_hes_patient <- tte_hes_cohort %>%
+  inner_join(hes_patient, by = "patid") %>%
+  group_by(gen_hesid) %>%
+  mutate(duplicate = n_distinct(patid)) %>%
+  ungroup()
+
+# There are no duplicates
+remove(tte_hes_patient, hes_patient)
+
+# Primary psychiatric diagnosis, at the episode level
+tte_hes_primarydiag <- tte_hes_cohort %>%
+  inner_join(hes_primarydiag, by = "patid") %>%
+  filter(d_order == 1) %>% # filter to primary diagnosis 
+  filter(grepl("(?i)F", ICD)) %>% # select diagnoses of interest (any F diagnosis)
+  group_by(patid, spno) %>%
+  mutate(primary_ICD = paste(unique(ICD), collapse = "/")) %>% # paste all primary diagnoses per patient and spellno into one column
+  ungroup() %>%
+  select(-ICD, -d_order, -epiend, -epikey)
+
+#Self-harm at any diagnosis level (as not recorded as primary diagnosis in HES)
+# they are most often 2nd/3rd. Things like poisoning are the primary.
+tte_hes_selfharm <- tte_hes_cohort %>%
+  inner_join(hes_primarydiag, by = "patid") %>%
+  filter(grepl("(?i)X6|X7|X80|X81|X82|X83|X84|Y87.0", ICD)) %>% # select diagnoses of interest
+  group_by(patid, spno) %>%
+  mutate(selfharm_ICD = paste(unique(ICD), collapse = "/")) %>% # paste all primary diagnoses per patient and spellno into one column
+  ungroup() %>%
+  select(-ICD, -d_order, -epiend, -epikey)
+
+# Full join of primary psych and self-harm admissions
+tte_hes_primarydiagandselfharm <- tte_hes_primarydiag %>%
+  full_join(tte_hes_selfharm, by = c("patid", "spno", "cohortentrydate")) %>% # some epistart dates are different for patients with self-harm and F diagnoses (different episodes within same hosp stay), so can't be used to merge on
+  group_by(patid, spno) %>%
+  mutate(eligible_ICD = paste(unique(na.omit(primary_ICD)), unique(na.omit(selfharm_ICD)), collapse = "/", sep = "/")) %>%
+  mutate(eligible_ICD = gsub("^/|/$", "", eligible_ICD)) %>% # remove leading/trailing slashes
+  select(-epistart.x, -epistart.y)
+
+remove(tte_hes_primarydiag, tte_hes_selfharm)
+
+# Identify spells that are associated with relevant admissions, used in subsequent merges
+spells <- tte_hes_primarydiagandselfharm %>%
+  select(patid, spno) %>%
+  distinct()
+
+# Hospital level information
+tte_hes_hosp <- tte_hes_cohort %>%
+  inner_join(spells, by = "patid") %>% # inner join to keep only patients eligible for linkage and those that had relevant spells identified
+  left_join(hes_hosp, by = c("patid", "spno")) %>% # left join to retrieve data at the hospital admission level
+  group_by(patid, spno) %>%
+  mutate(hosplevel_ICD = paste(unique(ICD), collapse = "/")) %>% # paste all hospital admission primary diagnoses per patient and spellno into one column
+  ungroup() %>%
+  select(-discharged, -ICD) %>%
+  distinct()
+
+# Episode level information
+hes_admimeth <- read_excel("Data files/Misc/hes_admimeth.xlsx", 
+                           col_types = c("text", "text"))
+
+hes_disdest <- read_excel("Data files/Misc/hes_disdest.xlsx", 
+                          col_types = c("numeric", "text"))
+
+tte_hes_episodes <- tte_hes_cohort %>%
+  inner_join(spells, by = "patid") %>%
+  left_join(hes_episodes, by = c("patid", "spno")) %>%
+  group_by(patid, spno) %>%
+  mutate(earliest_epistart = min(epistart)) %>% # calculate earliest epistart and use this in people with missing admission date
+  ungroup() %>%
+  mutate(admidate = coalesce(admidate, earliest_epistart),
+         epistart = coalesce(epistart, admidate)) %>% # if epistart date is missing, then use admidate
+  filter(!is.na(admidate)) %>% 
+  filter(!is.na(epistart)) %>% 
+  group_by(patid, spno, admidate) %>%
+  arrange(eorder) %>% # arrange by episode order
+  mutate(mainspef_all = paste(unique(mainspef), collapse = "/"), # identify treating and consultant specialty codes, merge into one field
+         mainspef_all = gsub("&", "", mainspef_all), # remove & from column
+         mainspef_all = ifelse(mainspef_all %in% c("", "NA"), NA, mainspef_all),  # recode empty/missing 
+         tretspef_all = paste(unique(tretspef), collapse = "/"),
+         tretspef_all = gsub("&", "", tretspef_all), # remove & from column
+         tretspef_all = ifelse(tretspef_all %in% c("", "NA"), NA, tretspef_all), # recode empty/missing 
+         psych_speciality_code = ifelse(grepl("710|711|712|713|715", tretspef_all) | # these are the psychiatry consultant specialty codes
+                                          grepl("710|711|712|713|715", mainspef_all), 
+                                        1, 0),
+         classpat_all = paste(unique(classpat), collapse = "/"),
+         epitype_all = paste(unique(epitype), collapse = "/"),
+         admimeth_first = admimeth[which.min(as.numeric(epistart))], # admission method associated with first episode
+         disdest_last = disdest[which.max(as.numeric(epistart))], # discharge destination and method associated with last episode
+         dismeth_last = dismeth[which.max(as.numeric(epistart))]) %>%
+  ungroup() %>%
+  select(patid, cohortentrydate, spno, admidate_epi = admidate, discharged, mainspef_all, tretspef_all, psych_speciality_code, classpat_all, epitype_all, admimeth_first, disdest_last, dismeth_last) %>%
+  mutate(admimeth_first = as.character(admimeth_first)) %>%
+  distinct() %>%
+  left_join(hes_admimeth, by = c("admimeth_first" = "code")) %>% #Recode admimeth
+  select(-admimeth_first) %>%
+  rename(admimeth_first = description) %>%
+  left_join(hes_disdest, by = c("disdest_last" = "code")) %>% # Recode disdest
+  select(-disdest_last) %>%
+  rename(disdest_last = description)
+
+# HOSPITAL SPELL LEVEL DATASET
+
+# Full join of all HES data, at hospital spell level
+hes_dataset <- tte_hes_primarydiagandselfharm %>% # episode with primary psychiatric diagnosis
+  full_join(tte_hes_hosp, by = c("patid", "spno", "cohortentrydate")) %>% #  link to hospital level information (other diagnoses and admission date)
+  full_join(tte_hes_episodes, by = c("patid", "spno", "cohortentrydate")) %>% # link to more detailed episode information
+  distinct() %>%
+  filter(grepl("1", classpat_all)) %>% # remove regular day/night attendances and baby delivery admissions only
+  distinct() %>%
+  mutate(admidate = coalesce(admidate, admidate_epi)) %>%
+  select(-admidate_epi) %>%
+  filter(admidate < '2020-01-01')
+
+# PATIENT LEVEL DATASET
+# Data frame with hospital admissions within 2 years after cohort entry date
+tte_admissions_2yr <- hes_dataset %>%
+  filter(admidate >= cohortentrydate & admidate <= cohortentrydate + days(730)) %>% # filter to records within 2 years
+  group_by(patid) %>%
+  mutate(hospadmit_2yr_any = 1,
+         hospadmit_2yr_num = n_distinct(admidate),
+         datediff = as.numeric(admidate - cohortentrydate),
+         min = min(admidate)) %>%
+  ungroup() %>%
+  filter(admidate == min) %>% # filter to first only
+  rename(hospadmit_daystofirst = datediff, hospadmit_first_date = admidate, hospadmit_first_ICD = eligible_ICD) %>%
+  select(patid, hospadmit_2yr_any, hospadmit_daystofirst, hospadmit_first_date, hospadmit_first_ICD, hospadmit_2yr_num, mainspef_all, tretspef_all) %>%
+  distinct()
+
+# Data frame with hospital admissions within 2 years after cohort entry date, only with psych speciality codes
+tte_admissions_2yr_psychspecialty <- hes_dataset %>%
+  filter(admidate >= cohortentrydate & admidate <= cohortentrydate + days(730)) %>% # filter to records within 2 years
+  filter(psych_speciality_code == 1) %>%
+  group_by(patid) %>%
+  mutate(hospadmit_psychspecialty_2yr_any = 1,
+         hospadmit_psychspecialty_2yr_num = n_distinct(admidate),
+         datediff = as.numeric(admidate - cohortentrydate),
+         min = min(admidate)) %>%
+  ungroup() %>%
+  filter(admidate == min) %>% # filter to first only
+  rename(hospadmit_psychspecialty_daystofirst = datediff, hospadmit_psychspecialty_first_date = admidate) %>%
+  select(patid, hospadmit_psychspecialty_2yr_any, hospadmit_psychspecialty_daystofirst, hospadmit_psychspecialty_first_date, 
+         hospadmit_psychspecialty_2yr_num, mainspef_psychspecialty_all = mainspef_all, tretspef_psychspecialty_all = tretspef_all) %>%
+  distinct()
+
+# Data frame with hospital admissions within 2 years before cohort entry date
+tte_prioradmissions_2yr <- hes_dataset %>%
+  filter(admidate < cohortentrydate & admidate >= cohortentrydate - days(730)) %>% # filter to records within 2 years
+  group_by(patid) %>%
+  mutate(priorhosp_any = 1,
+         priorhosp_num = n_distinct(admidate)) %>%
+  ungroup() %>%
+  select(patid, priorhosp_any, priorhosp_num) %>%
+  distinct()
+
+# Merge
+tte_psychosp <- tte_hes_cohort %>%
+  left_join(tte_prioradmissions_2yr, by = "patid") %>%
+  left_join(tte_admissions_2yr, by = "patid") %>%
+  left_join(tte_admissions_2yr_psychspecialty, by = "patid") %>%
+  mutate(priorhosp_any = if_else(is.na(priorhosp_any), 0, priorhosp_any),
+         priorhosp_num = if_else(is.na(priorhosp_num), 0, priorhosp_num),
+         hospadmit_2yr_any = if_else(is.na(hospadmit_2yr_any), 0, hospadmit_2yr_any),
+         hospadmit_psychspecialty_2yr_any = if_else(is.na(hospadmit_psychspecialty_2yr_any), 0, hospadmit_psychspecialty_2yr_any),
+         hospadmit_2yr_num = if_else(is.na(hospadmit_2yr_num), 0, hospadmit_2yr_num),
+         hospadmit_psychspecialty_2yr_num = if_else(is.na(hospadmit_psychspecialty_2yr_num), 0, hospadmit_psychspecialty_2yr_num)) %>%
+  group_by(patid) %>%  # some have more than one admission starting on the same day, with different consultant details, merge consultant details into the same row
+  mutate(tretspef_all = ifelse(all(is.na(tretspef_all)), NA, paste(unique(tretspef_all), collapse = "/")), # ignore missing values
+         mainspef_all = ifelse(all(is.na(mainspef_all)), NA, paste(unique(mainspef_all), collapse = "/")),
+         mainspef_psychspecialty_all = ifelse(all(is.na(mainspef_psychspecialty_all)), NA, paste(unique(mainspef_psychspecialty_all), collapse = "/")),
+         tretspef_psychspecialty_all = ifelse(all(is.na(tretspef_psychspecialty_all)), NA, paste(unique(tretspef_psychspecialty_all), collapse = "/")),
+         hospadmit_first_ICD = ifelse(all(is.na(hospadmit_first_ICD)), NA, paste(unique(hospadmit_first_ICD), collapse = "/"))) %>%
+  ungroup() %>%
+  distinct() %>%
+  mutate(hes_enddate = as.Date("2021-03-31")) %>% # HES APC data collecton end date was 31Mar21
+  select(-cohortentrydate)
+
+# Check for duplicate IDs
+tte_psychosp %>%
+  count(patid) %>%
+  filter(n>1)
+
+# there are no duplicates
+
+# Merge hospitalisations into main cohort
+psychhosp_prev <- tte_prevalent_cohort %>%
+  select(patid) %>%
+  left_join(tte_psychosp, by = "patid")
+
+tte_prevalent_cohort <- merge(tte_prevalent_cohort, psychhosp_prev, by = "patid", all = TRUE)
+remove(psychhosp_prev, tte_hes_cohort, tte_psychosp)
+
+tte_prevalent_psychhosp <- tte_prevalent_cohort %>%
+  select(patid, cohortentrydate, hes_apc_e, hospadmit_2yr_any, hospadmit_daystofirst, hospadmit_first_date,
+         hospadmit_psychspecialty_2yr_any, hospadmit_psychspecialty_daystofirst, hospadmit_psychspecialty_first_date,
+         hes_enddate, deathdate, discontinue_date, switch_date, regenddate, lcd, studyend_date) %>%
+  filter(hes_apc_e == 1) %>%
+  mutate(fupend_date = pmin(hes_enddate, deathdate, studyend_date, na.rm = TRUE),
+         protocol_censordate = pmin(discontinue_date, switch_date, regenddate, lcd, studyend_date, na.rm = TRUE)) %>% # PP analyses censored at discontinuation/switch, or registration end/lcd as can't determine if they remained per protocol after that point
+  select(-discontinue_date, -switch_date, -hes_apc_e, -hes_enddate) %>%
+  mutate(fuptime_days = as.numeric(fupend_date - cohortentrydate), # calculate HES follow-up time (ITT)
+         fuptime_days_cen = case_when(fuptime_days > 729 ~ 730,
+                                      TRUE ~ fuptime_days),
+         fuptime_pp_days = as.numeric(protocol_censordate - cohortentrydate), # calculate HES follow-up time (PP)
+         psychhosp_pp_fuptime_days_cen = case_when(fuptime_pp_days > 729 ~ 730,
+                                               TRUE ~ fuptime_pp_days)) # censor at 2 years (to be used for people without events)
+
+# Primary ITT analysis
+tte_prevalent_psychhosp_main <- tte_prevalent_psychhosp %>%
+  mutate(psychhosp_main_fuptime_days_cen = coalesce(hospadmit_daystofirst, fuptime_days_cen)) %>%  # coalesce days to first admission (for those with events) with fuptime_cen (for those without events)
+  select(patid, psychhosp_main_fuptime_days_cen)
+
+# Sensitivity analysis (any hospitalisation record with a primary psychiatric ICD code & corresponding psychiatric consultant codes)
+tte_prevalent_psychhosp_sens <- tte_prevalent_psychhosp %>%
+  mutate(psychhosp_sens_fuptime_days_cen = coalesce(hospadmit_psychspecialty_daystofirst, fuptime_days_cen)) %>% # coalesce days to first admission (for those with events) with fuptime_cen (for those without events)
+  select(patid, psychhosp_sens_fuptime_days_cen)
+
+# Per protocol analysis (any hospitalisation record with a primary psychiatric ICD code prior to discontinuation or switch date)
+tte_prevalent_psychhosp_pp <- tte_prevalent_psychhosp %>%
+  mutate(psychhosp_main_fuptime_days_cen = coalesce(hospadmit_daystofirst, psychhosp_pp_fuptime_days_cen), # start same as primary analysis
+         pp_censor = hospadmit_first_date > protocol_censordate, # identify records that need to be censored
+         hospadmit_2yr_pp = case_when(pp_censor == TRUE ~ 0, # create new PP event indicator
+                                      TRUE ~ hospadmit_2yr_any)) %>% # use existing fup time for all others
+  select(patid, hospadmit_2yr_pp, psychhosp_pp_fuptime_days_cen)
+
+tte_prevalent_cohort <- tte_prevalent_cohort %>%
+  left_join(tte_prevalent_psychhosp_main, by = "patid") %>%
+  left_join(tte_prevalent_psychhosp_sens, by = "patid") %>%
+  left_join(tte_prevalent_psychhosp_pp, by = "patid")
+
+remove(hes_dataset, hes_episodes, hes_hosp, hes_primarydiag, hes_admimeth, hes_disdest, spells, tte_prioradmissions_2yr, tte_admissions_2yr, 
+       tte_admissions_2yr_psychspecialty, tte_hes_patient, tte_hes_episodes, tte_hes_hosp, tte_hes_primarydiag, tte_hes_primarydiagandselfharm, 
+       tte_hes_selfharm, tte_prevalent_psychhosp_sens, tte_prevalent_psychhosp_main, tte_prevalent_psychhosp, tte_prevalent_psychhosp_pp)
+
+# Add per protocol indicators for each time point (to be used to define per protocol cardiometabolic outcome analysis)
+tte_prevalent_cohort <- tte_prevalent_cohort %>%
+  mutate(sixm_date = cohortentrydate + 180,
+         oney_date = cohortentrydate + 365,
+         twoy_date = cohortentrydate + 730) %>%
+  rowwise() %>%
+  mutate(perprotocol_enddate = pmin(deathdate, discontinue_date, switch_date, regenddate, lcd, studyend_date, na.rm = TRUE)) %>%
+  mutate(active_6m = case_when(perprotocol_enddate < sixm_date ~ 0,
+                               TRUE ~ 1),
+         active_1y = case_when(perprotocol_enddate < oney_date ~ 0,
+                               TRUE ~ 1),
+         active_2y = case_when(perprotocol_enddate < twoy_date ~ 0,
+                               TRUE ~ 1)) %>%
+  mutate(days_pp = as.numeric(perprotocol_enddate - cohortentrydate))
+
+# Competing risks regression variables
+# event variable needs to be a factor, with 0 as the censored people, 1 as the outcome of interest, 2 as the competing risk event
+
+# Psychiatric hospitalisation
+# if died without a psych hosp (during the HES linkage period), then need to be coded as '2' as these are the people relevant to competing risks
+tte_prevalent_cohort <- tte_prevalent_cohort %>%
+  mutate(diedafterhesend = deathdate > hes_enddate, # identify if death was in the HES linkage period
+         hospdeath_crr = case_when((!is.na(deathdate) & diedby2y == 1) & (is.na(hospadmit_first_date) & hospadmit_2yr_any == 0 & diedafterhesend != TRUE) ~ 2, # died within HES period with no hosp admission (competing risk met)
+                                   TRUE ~ hospadmit_2yr_any), # otherwise use psychiatric hospitalisation event
+         hospdeath_crr = as.factor(hospdeath_crr), # convert to factor
+         hospdeath_crr_fuptime = case_when(hospdeath_crr == 2 ~ mortality_fuptime_days_cen, # if competing risk met, use mortality follow-up
+                                           TRUE ~ psychhosp_main_fuptime_days_cen), # otherwise use psychiatric hospitalisation fup time
+         hospdeath_pp_crr = case_when((!is.na(deathdate) & diedby2y == 1) & hospadmit_2yr_pp == 0 & diedafterhesend != TRUE ~ 2, # per protocol hospitalisation, died within HES period with no hosp admission (competing risk met)
+                                      TRUE ~ hospadmit_2yr_pp), # otherwise use psychiatric hospitalisation PP event
+         hospdeath_pp_crr = factor(hospdeath_pp_crr, levels =c(0, 1, 2)), # convert to factor
+         hospdeath_pp_crr_fuptime = case_when(hospdeath_pp_crr == 2 ~ mortality_fuptime_days_cen, # if PP competing risk met, use mortality follow-up
+                                              TRUE ~ psychhosp_pp_fuptime_days_cen), # otherwise use psychiatric hospitalisation PP fup time
+         hospdeath_psychspec_crr = case_when((!is.na(deathdate) & diedby2y == 1) & hospadmit_psychspecialty_2yr_any == 0 & diedafterhesend != TRUE ~ 2,
+                                             TRUE ~ hospadmit_psychspecialty_2yr_any),
+         hospdeath_psychspec_crr_fuptime = case_when(hospdeath_psychspec_crr == 2 ~ mortality_fuptime_days_cen, # if psych hosp speciality competing risk met, use mortality follow-up
+                                              TRUE ~ psychhosp_sens_fuptime_days_cen)) %>% # otherwise use psychiatric hospitalisation specialty fup time
+  select(-diedafterhesend)
+
+# Time to discontinuation
+tte_prevalent_cohort <- tte_prevalent_cohort %>%
+  mutate(discdeath_crr = case_when((!is.na(deathdate) & diedby2y == 1) & (is.na(discontinue_date) & discontinued == 0) ~ 2, # died without prior discontinuation (competing risk met)
+                                   TRUE ~ discontinued),
+         discdeath_crr = factor(discdeath_crr, levels =c(0, 1, 2)),
+         discdeath_crr_fuptime = case_when(discdeath_crr == 2 ~ mortality_fuptime_days_cen,
+                                           TRUE ~ discontinuation_fuptime_days_cen))
+                          
+# Remove unused levels of the trt_group and gender factor
+tte_prevalent_cohort$trt_group <- droplevels(tte_prevalent_cohort$trt_group, exclude = "Mulitple")
+tte_prevalent_cohort$gender <- droplevels(tte_prevalent_cohort$gender, exclude = c("Indeterminate", "Unknown"))
+
+#Check for duplicate IDs
+tte_prevalent_cohort %>%
+  count(patid) %>%
+  filter(n>1)
+
+#Save to file
+n_distinct(tte_prevalent_cohort$patid) #26,537
+save(tte_prevalent_cohort, file = "tte_prevalent_cohort.rdata")
+
+# MULTIPLE IMPUTATION ####
+
+# Packages
+library(dplyr)
+library(furrr)
+library(mice)
+library(parallel)
+library(parallelly)
+library(finalfit)
+
+# Set working directory
+setwd(paste0(path))
+
+#Load data
+load(file = "tte_prevalent_cohort.Rdata")
+
+#Select variables for inclusion in imputation model
+adjustment_set <- c("age_atprevcohortentry", "gender", "ethnicity_cat_cprdhes", "diag_prev", "region", "pat_2019imd_quintile", "prac_2019imd_quintile", "prevcohortentry_year", "gpconsults_last6m", "smoking_status_cat", 
+                    "prioralcoholabuse", "priorsubstanceabuse", "priordyslipidaemia", "priordiabetes", "priorhypertension", "priorcerebrovasculardisease", "priormyocardialinfarction", "priorrenaldisease", "priorliverdisease", 
+                    "apuse_prior2years", "lipiddrugs_prior2years", "hypertensiondrugs_prior2years", "antidiabetics_prior2years", "antidepressant_prior2years", "moodstab_prior2years")
+# cardiometabolic adjustment variables defined separately
+
+aux_variables <- c("patid", "trt_group", "last_smi_diag", "age_atfirstdiag", "age_atfirstap", "baseline_bmi_cat",
+                   "active_6m", "active_1y", "active_2y")
+
+# Cardiometabolic variables
+outcome_names <- c("totalcholesterol", "ldl", "hdl", "triglycerides", "tchdlratio", "weightkg", "hba1c", "systolicbp", "diastolicbp", "glucose")
+prefixes <- c("baseline_", "sixm_", "oney_", "twoy_")
+full_names <- lapply(prefixes, function(prefix) paste0(prefix, outcome_names))
+cardiometabolic_outcomes <- unlist(full_names)
+remove(outcome_names, prefixes, full_names)
+
+# Variables required for effectiveness outcomes (psychiatric hospitalisation variables not included as only available in the HES population)
+effectiveness_vars <- c("mortality_fuptime_days_cen", "diedby6m", "diedby1y", "diedby2y", "mortality_pp_fuptime_days_cen", "diedby2yr_pp", # mortality 
+                        "discontinuation_fuptime_days_cen", "discontinued", # discontinuation
+                        "switched") # switched to another study medication
+
+#Select variables for inclusion in imputation model
+imputationvariables <- tte_prevalent_cohort %>%
+  select(patid, trt_group, all_of(c(adjustment_set, aux_variables, effectiveness_vars, cardiometabolic_outcomes))) %>%
+  mutate_if(is.character, as.factor) # convert character columns to factors, required for imputation to run
+
+# Check structure of data
+str(imputationvariables)
+
+# Exclude patid from imputation
+predM <- finalfit::missing_predictorMatrix(imputationvariables,
+                                           drop_from_imputed = c("patid"),
+                                           drop_from_imputer = c("patid"))
+
+#Check updated predictor matrix
+matrix <- as.data.frame(predM)
+remove(matrix)
+
+# Impute data using mice, in parralel (futuremice)
+tte_imputed <- futuremice(imputationvariables,
+                          m = 25, # number of imputed datasets to generate
+                          maxit = 5, # number of iterations per imputation
+                          predictorMatrix = predM, # the updated matrix as created above
+                          n.core = 5, # number of cores to use, imputations are split equally across cores
+                          future.plan = "multisession", # type of parallel process
+                          parallelseed = 123) # set seed for reproducibility
+
+# View logged events
+tte_imputed$loggedEvents
+
+# View summary of imputation
+summary(tte_imputed)
+
+# Convert to long
+tte_imputed_long <- mice::complete(tte_imputed, action="long", include = TRUE) # Convert to long for saving
+
+# Add extra study variables
+variables_to_add <- tte_prevalent_cohort %>%
+  select(patid, hes_apc_e, age_atcohortentry_cat_two, priorhosp_any, cohortentry_timeperiod,
+         psychhosp_main_fuptime_days_cen,hospadmit_2yr_any, 
+         psychhosp_pp_fuptime_days_cen, hospadmit_2yr_pp, 
+         psychhosp_sens_fuptime_days_cen, hospadmit_psychspecialty_2yr_any,
+         hospdeath_crr, hospdeath_crr_fuptime, 
+         hospdeath_pp_crr, hospdeath_pp_crr_fuptime, 
+         hospdeath_psychspec_crr, hospdeath_psychspec_crr_fuptime,
+         discdeath_crr, discdeath_crr_fuptime,
+         switch_date, discontinue_date)
+
+tte_imputed_long <- tte_imputed_long %>%
+  left_join(variables_to_add, by = "patid")
+
+# Save to file
+n_distinct(tte_imputed_long$patid) #26,537
+save(tte_imputed_long, file = "tte_imputed_long.rdata")
+
+remove(tte_prevalent_cohort, tte_imputed, tte_imputed_long, variables_to_add, imputationvariables)
+
+# Package versions
+packageVersion("dplyr") # 1.1.4
+packageVersion("tidyr") # 1.3.1
+packageVersion("stringr") # 1.5.1
+packageVersion("forcats") # 1.0.0
+packageVersion("lubridate") # 1.9.3
+packageVersion("readr") # 2.1.5
+packageVersion("readxl") # 1.4.3
+packageVersion("data.table") # 1.5.4
+packageVersion("purrr") # 1.0.2
+packageVersion("rlang") # 1.1.4
+packageVersion("reshape2") # 1.4.4
+packageVersion("doseminer") # 0.1.2
+packageVersion("drugprepr") # 0.0.4
+packageVersion("chlorpromazineR") # 0.2.0
+packageVersion("ggplot2") # 3.5.1
+packageVersion("gtsummary") # 2.0.1
+packageVersion("gt") # 0.11.0
+packageVersion("mice") # 3.16.0
+packageVersion("finalfit") # 1.0.8
+packageVersion("tidylog") # 1.1.0
+packageVersion("vroom") # 1.6.5
+packageVersion("furrr") # 0.3.1
+packageVersion("parallel") # 4.4.1
+packageVersion("parallelly") # 1.38.0
