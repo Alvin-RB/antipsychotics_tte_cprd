@@ -4,7 +4,7 @@
 
 > Richards-Belle A, Launders N, Hardoon S, Richards A, Man KKC, Davies NM, Bramon E, Hayes JF, Osborn DPJ. (2025) Comparative cardiometabolic safety and effectiveness of aripiprazole in people with severe mental illness: A target trial emulation.
 
-This study aimed to emualte a trial on the following research question: In adults diagnosed with SMI who are prescribed a new antipsychotic in primary care, does aripiprazole, as compared to olanzapine, quetiapine, and risperidone, have a better cardiometabolic safety profile with similar comparative effectiveness? The data source is [Clinical Practice Research Datalink (CPRD)](https://www.cprd.com/). To support transparency and open science, this repository hosts code and materials which support the manuscript - including:
+This study aimed to emulate a trial on the following research question: In adults diagnosed with SMI who are prescribed a new antipsychotic in primary care, does aripiprazole, as compared to olanzapine, quetiapine, and risperidone, have a better cardiometabolic safety profile with similar comparative effectiveness? The data source is [Clinical Practice Research Datalink (CPRD)](https://www.cprd.com/). To support transparency and open science, this repository hosts code and materials which support the manuscript - including:
 
 #### Code lists
 
